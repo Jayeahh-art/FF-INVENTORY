@@ -25,10 +25,11 @@ const ROUTES = [
 // ---------- API client ----------
 
 async function api(action, payload) {
+  const userEmail = localStorage.getItem('ff_user_email') || '';
   const res = await fetch(window.CONFIG.API_URL, {
     method: 'POST',
     // Note: NO custom headers — avoids CORS preflight to GAS.
-    body: JSON.stringify({ action, payload: payload || {} })
+    body: JSON.stringify({ action, payload: payload || {}, user_email: userEmail })
   });
   const json = await res.json();
   if (!json.ok) throw new Error(json.error || 'Request failed');
@@ -101,6 +102,8 @@ async function boot() {
       </div>`;
     return;
   }
+  const stored = localStorage.getItem('ff_user_email');
+  if (!stored) { showLogin(); return; }
   try {
     const me = await api('me');
     state.me = me;
@@ -115,16 +118,47 @@ function showLogin(msg) {
   document.getElementById('app').classList.add('hidden');
   const login = document.getElementById('login');
   login.classList.remove('hidden');
-  if (msg) {
-    const m = document.getElementById('login-msg');
-    m.textContent = msg;
-    m.classList.remove('hidden');
-  }
-  document.getElementById('login-btn').onclick = () => {
-    // Opening the API URL in a new tab triggers Google's auth flow for the Apps Script web app.
-    window.open(window.CONFIG.API_URL, '_blank');
-    setTimeout(() => boot(), 200);
+  // Replace the inner card so the user can type an email.
+  login.innerHTML = `
+    <div class="bg-white rounded-2xl shadow-xl p-8 max-w-md w-full">
+      <div class="text-center mb-6">
+        <div class="w-14 h-14 rounded-xl bg-brand-600 mx-auto flex items-center justify-center text-white text-2xl font-bold">FF</div>
+        <h1 class="text-2xl font-bold mt-3">FF Inventory</h1>
+        <p class="text-slate-500 text-sm mt-1">Restaurant inventory management</p>
+      </div>
+      ${msg ? `<div class="text-sm text-rose-600 bg-rose-50 border border-rose-200 rounded p-2 mb-3">${msg}</div>` : ''}
+      <label class="block mb-3">
+        <span class="text-xs font-medium text-slate-600 uppercase tracking-wide">Email</span>
+        <input id="login-email" class="input mt-1" type="email" placeholder="you@finandfin.com" value="${localStorage.getItem('ff_user_email') || ''}" />
+      </label>
+      <button id="login-btn" class="btn btn-primary w-full justify-center">Sign in</button>
+      <p class="text-xs text-slate-400 mt-4 text-center">Your email must be added by an admin in the Users tab. First-time setup adds whoever runs <code>setup()</code> as admin.</p>
+    </div>
+  `;
+  const emailInput = document.getElementById('login-email');
+  emailInput.focus();
+  const submit = async () => {
+    const email = emailInput.value.trim().toLowerCase();
+    if (!email || email.indexOf('@') < 0) { toast('Enter a valid email', 'error'); return; }
+    localStorage.setItem('ff_user_email', email);
+    try {
+      const me = await api('me');
+      state.me = me;
+      showApp();
+    } catch (err) {
+      localStorage.removeItem('ff_user_email');
+      showLogin(err.message);
+    }
   };
+  document.getElementById('login-btn').onclick = submit;
+  emailInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
+}
+
+function signOut() {
+  localStorage.removeItem('ff_user_email');
+  state.me = null;
+  location.hash = '';
+  showLogin();
 }
 
 function showApp() {
@@ -135,6 +169,16 @@ function showApp() {
   document.getElementById('me-name').textContent = state.me.name || state.me.email;
   document.getElementById('me-email').textContent = state.me.email;
   document.getElementById('me-role').textContent = state.me.role;
+  // Wire sign-out
+  const meRole = document.getElementById('me-role');
+  if (!document.getElementById('signout-btn')) {
+    const btn = document.createElement('button');
+    btn.id = 'signout-btn';
+    btn.className = 'mt-2 text-xs text-slate-400 hover:text-white underline';
+    btn.textContent = 'Sign out';
+    btn.onclick = signOut;
+    meRole.parentNode.appendChild(btn);
+  }
 
   renderNav();
   window.addEventListener('hashchange', router);
