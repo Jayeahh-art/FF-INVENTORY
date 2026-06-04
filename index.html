@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FF Inventory</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            brand: { 50:'#f0f9ff', 100:'#e0f2fe', 500:'#0ea5e9', 600:'#0284c7', 700:'#0369a1', 800:'#075985' }
+          }
+        }
+      }
+    };
+  </script>
+  <style>
+    [v-cloak] { display: none; }
+    body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    .nav-link { display:flex; align-items:center; gap:.5rem; padding:.5rem .75rem; border-radius:.5rem; color:#cbd5e1; }
+    .nav-link:hover { background:#1e293b; color:white; }
+    .nav-link.active { background:#0284c7; color:white; }
+    .btn { display:inline-flex; align-items:center; gap:.4rem; padding:.45rem .9rem; border-radius:.5rem; font-weight:500; font-size:.875rem; transition:all .15s; cursor:pointer; }
+    .btn-primary { background:#0284c7; color:white; }
+    .btn-primary:hover { background:#0369a1; }
+    .btn-secondary { background:#e5e7eb; color:#111827; }
+    .btn-secondary:hover { background:#d1d5db; }
+    .btn-danger { background:#dc2626; color:white; }
+    .btn-danger:hover { background:#b91c1c; }
+    .btn-ghost { color:#475569; }
+    .btn-ghost:hover { background:#f1f5f9; }
+    .input, select, textarea {
+      width:100%; padding:.5rem .75rem; border:1px solid #d1d5db; border-radius:.5rem;
+      background:white; font-size:.875rem;
+    }
+    .input:focus, select:focus, textarea:focus { outline:none; border-color:#0ea5e9; box-shadow:0 0 0 3px rgba(14,165,233,.15); }
+    .badge { display:inline-flex; align-items:center; padding:.15rem .55rem; border-radius:9999px; font-size:.7rem; font-weight:600; }
+    table { width:100%; border-collapse:collapse; }
+    th { text-align:left; font-size:.7rem; text-transform:uppercase; letter-spacing:.05em; color:#64748b; padding:.6rem .75rem; border-bottom:1px solid #e2e8f0; background:#f8fafc; }
+    td { padding:.6rem .75rem; border-bottom:1px solid #f1f5f9; font-size:.875rem; }
+    tr:hover td { background:#fafbfd; }
+    .modal-backdrop { position:fixed; inset:0; background:rgba(15,23,42,.5); display:flex; align-items:center; justify-content:center; z-index:50; padding:1rem; }
+    .modal { background:white; border-radius:.75rem; width:100%; max-width:42rem; max-height:90vh; overflow-y:auto; box-shadow:0 25px 50px -12px rgba(0,0,0,.25); }
+    .toast { position:fixed; top:1rem; right:1rem; z-index:60; min-width:18rem; max-width:24rem; }
+    .spinner { display:inline-block; width:1rem; height:1rem; border:2px solid #cbd5e1; border-top-color:#0284c7; border-radius:50%; animation:spin .7s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body class="bg-slate-50 text-slate-900">
+
+  <div id="boot" class="min-h-screen flex items-center justify-center">
+    <div class="text-center">
+      <div class="spinner mx-auto mb-3"></div>
+      <p class="text-slate-500 text-sm">Loading…</p>
+    </div>
+  </div>
+
+  <div id="login" class="hidden min-h-screen flex items-center justify-center bg-gradient-to-br from-brand-50 to-slate-100 p-4">
+    <div class="bg-white rounded-2xl shadow-xl p-8 max-w-md w-full">
+      <div class="text-center mb-6">
+        <div class="w-14 h-14 rounded-xl bg-brand-600 mx-auto flex items-center justify-center text-white text-2xl font-bold">FF</div>
+        <h1 class="text-2xl font-bold mt-3">FF Inventory</h1>
+        <p class="text-slate-500 text-sm mt-1">Restaurant inventory management</p>
+      </div>
+      <div id="login-msg" class="text-sm text-rose-600 mb-3 hidden"></div>
+      <p class="text-sm text-slate-600 mb-4">Sign in is via your Google account. When you click below, you'll authorize this app to read your email.</p>
+      <button id="login-btn" class="btn btn-primary w-full justify-center">Sign in with Google</button>
+      <p class="text-xs text-slate-400 mt-4 text-center">First-time setup? Run <code>setup()</code> in the Apps Script editor first.</p>
+    </div>
+  </div>
+
+  <div id="app" class="hidden min-h-screen flex">
+    <!-- Sidebar -->
+    <aside class="w-60 bg-slate-900 text-slate-200 flex-shrink-0 hidden md:flex flex-col">
+      <div class="p-4 border-b border-slate-800">
+        <div class="flex items-center gap-2">
+          <div class="w-9 h-9 rounded-lg bg-brand-600 flex items-center justify-center font-bold">FF</div>
+          <div>
+            <div class="font-semibold">FF Inventory</div>
+            <div class="text-xs text-slate-400">v1.0</div>
+          </div>
+        </div>
+      </div>
+      <nav id="nav" class="flex-1 p-3 space-y-1 text-sm"></nav>
+      <div class="p-3 border-t border-slate-800 text-xs">
+        <div id="me-name" class="font-medium text-white"></div>
+        <div id="me-email" class="text-slate-400 truncate"></div>
+        <div id="me-role" class="text-brand-500 mt-1 uppercase tracking-wide font-semibold"></div>
+      </div>
+    </aside>
+
+    <!-- Main -->
+    <main class="flex-1 flex flex-col min-w-0">
+      <header class="bg-white border-b border-slate-200 px-6 py-3 flex items-center justify-between sticky top-0 z-40">
+        <div>
+          <h2 id="page-title" class="text-lg font-semibold">Dashboard</h2>
+          <p id="page-sub" class="text-xs text-slate-500"></p>
+        </div>
+        <div class="flex items-center gap-2">
+          <button id="refresh-btn" class="btn btn-ghost" title="Refresh">↻</button>
+        </div>
+      </header>
+      <div id="view" class="flex-1 p-6 overflow-auto"></div>
+    </main>
+  </div>
+
+  <div id="modal-root"></div>
+  <div id="toast-root"></div>
+
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
