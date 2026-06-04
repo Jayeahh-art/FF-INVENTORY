@@ -199,8 +199,11 @@ function showLogin(msg) {
     if (!email || email.indexOf('@') < 0) { toast('Enter a valid email', 'error'); return; }
     localStorage.setItem('ff_user_email', email);
     try {
-      const me = await api('me');
-      state.me = me;
+      // Call bootstrap (not 'me') so state.boot is populated before we render any view.
+      const data = await api('app.bootstrap');
+      state.me = data.me;
+      state.boot = data;
+      state.bootAt = Date.now();
       showApp();
     } catch (err) {
       localStorage.removeItem('ff_user_email');
