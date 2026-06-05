@@ -536,16 +536,19 @@ function viewItems(root) {
   const rows = state.boot.items;
   root.innerHTML = `
     <div class="flex justify-between items-center mb-4 gap-2">
-      <input id="items-q" class="input max-w-sm" placeholder="Search by name, brand, supplier, category…" />
-      ${can('manager') ? '<button class="btn btn-primary" id="new-item">+ New item</button>' : ''}
+      <input id="items-q" class="input max-w-sm" placeholder="Search by name, SKU, brand, supplier, category…" />
+      <div class="flex gap-2">
+        ${can('admin') ? '<button class="btn btn-ghost text-rose-600 text-xs" id="wipe-items" title="Delete all items (only if no transactions yet)">Wipe all</button>' : ''}
+        ${can('manager') ? '<button class="btn btn-primary" id="new-item">+ New item</button>' : ''}
+      </div>
     </div>
     <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-auto">
       <table>
         <thead><tr>
-          <th>Name</th><th>Brand</th><th>Category</th>
-          <th>Pack</th><th>Unit</th><th>Supplier</th>
-          <th class="text-right">Pack cost</th>
-          <th class="text-right">Ref ₱/unit</th>
+          <th>SKU</th><th>Name</th><th>Brand</th><th>Category</th><th>Unit</th>
+          <th class="text-right">Suppliers</th>
+          <th class="text-right">Best ₱/unit</th>
+          <th class="text-right">Preferred ₱/unit</th>
           <th class="text-right">On hand</th>
           <th class="text-right">WAC</th>
           <th></th>
@@ -556,20 +559,20 @@ function viewItems(root) {
   const render = (filter) => {
     const q = (filter || '').toLowerCase();
     const filtered = rows.filter(r =>
-      !q || (r.name + ' ' + r.sku + ' ' + r.brand + ' ' + r.category + ' ' + r.default_supplier_name).toLowerCase().includes(q)
+      !q || (r.name + ' ' + r.sku + ' ' + r.brand + ' ' + r.category + ' ' + r.default_supplier_name + ' ' + (r.supplier_prices || []).map(p => p.supplier_name).join(' ')).toLowerCase().includes(q)
     );
     document.getElementById('items-tbody').innerHTML = filtered.length === 0
       ? '<tr><td colspan="11" class="text-center text-slate-400 py-6">No items</td></tr>'
       : filtered.map(r => `
         <tr>
-          <td class="font-medium">${escapeHtml(r.name)} ${!r.active ? '<span class="badge bg-slate-100 text-slate-500 ml-1">inactive</span>' : ''} ${r.sku ? `<span class="text-xs text-slate-400 ml-1">${escapeHtml(r.sku)}</span>` : ''}</td>
+          <td class="text-slate-500 font-mono text-xs">${escapeHtml(r.sku)}</td>
+          <td class="font-medium">${escapeHtml(r.name)} ${!r.active ? '<span class="badge bg-slate-100 text-slate-500 ml-1">inactive</span>' : ''}</td>
           <td class="text-slate-500">${escapeHtml(r.brand)}</td>
           <td class="text-slate-500">${escapeHtml(r.category)}${r.subcategory ? ' / ' + escapeHtml(r.subcategory) : ''}</td>
-          <td class="text-slate-500 whitespace-nowrap">${escapeHtml(r.pack_size)}${r.pack_qty ? ` <span class="text-xs text-slate-400">(${fmtNum(r.pack_qty)})</span>` : ''}</td>
           <td class="text-slate-500">${escapeHtml(r.unit)}</td>
-          <td class="text-slate-500">${escapeHtml(r.default_supplier_name)}</td>
-          <td class="text-right text-slate-500">${r.pack_cost ? fmtMoney(r.pack_cost) : ''}</td>
-          <td class="text-right text-slate-500">${r.ref_unit_cost ? fmtMoney(r.ref_unit_cost) : ''}</td>
+          <td class="text-right ${r.supplier_count === 0 ? 'text-slate-300' : ''}">${r.supplier_count}</td>
+          <td class="text-right">${r.best_unit_cost ? fmtMoney(r.best_unit_cost) : '<span class="text-slate-300">—</span>'}</td>
+          <td class="text-right text-slate-500" title="${escapeHtml(r.default_supplier_name || 'no preferred supplier — showing best')}">${r.preferred_unit_cost ? fmtMoney(r.preferred_unit_cost) : '<span class="text-slate-300">—</span>'}</td>
           <td class="text-right">${fmtNum(r.on_hand)}</td>
           <td class="text-right">${fmtMoney(r.avg_cost)}</td>
           <td class="text-right whitespace-nowrap">
@@ -582,6 +585,11 @@ function viewItems(root) {
   };
   document.getElementById('items-q').oninput = (e) => render(e.target.value);
   if (can('manager')) document.getElementById('new-item').onclick = () => openItemModal();
+  if (can('admin')) document.getElementById('wipe-items').onclick = async () => {
+    if (!(await confirmDialog('Wipe ALL items, supplier prices, and stock state? Refuses if any inventory transactions exist.'))) return;
+    try { const r = await api('items.wipeAll', {}); toast(r, 'success'); bootRefresh(); }
+    catch (e) { toast(e.message, 'error'); }
+  };
   render('');
 }
 
@@ -589,33 +597,58 @@ async function openItemModal(id) {
   // Read from bootstrap cache instead of a fresh items.get round-trip.
   const existing = id ? (state.boot.items.find(i => i.id === id) || {}) : {};
   const suppliers = (state.boot.suppliers || []).filter(s => s.active);
+  // Working copy of supplier prices we'll mutate inside the modal
+  const prices = (existing.supplier_prices || []).map(p => ({ ...p }));
+
+  const priceRowHtml = (p, idx) => `
+    <tr data-pidx="${idx}">
+      <td>
+        <select class="input" data-f="supplier_id">
+          <option value="">— pick supplier —</option>
+          ${suppliers.map(s => `<option value="${s.id}" ${p.supplier_id === s.id ? 'selected' : ''}>${escapeHtml(s.name)}</option>`).join('')}
+        </select>
+      </td>
+      <td><input class="input" data-f="pack_size" value="${escapeHtml(p.pack_size || '')}" placeholder="1 KG" /></td>
+      <td><input class="input text-right" type="number" step="any" data-f="pack_qty" value="${p.pack_qty || ''}" placeholder="qty" /></td>
+      <td><input class="input text-right" type="number" step="any" data-f="pack_cost" value="${p.pack_cost || ''}" placeholder="cost" /></td>
+      <td class="text-right text-slate-500 unit-cost-cell">—</td>
+      <td><button class="btn btn-ghost text-rose-600 text-xs" data-rm>×</button></td>
+    </tr>`;
+
   const html = `
     <div class="grid grid-cols-2 gap-3">
       ${fieldset('Name *', `<input class="input" name="name" value="${escapeHtml(existing.name || '')}" required />`)}
-      ${fieldset('SKU', `<input class="input" name="sku" value="${escapeHtml(existing.sku || '')}" placeholder="optional" />`)}
+      ${fieldset('SKU (blank = auto)', `<input class="input font-mono" name="sku" value="${escapeHtml(existing.sku || '')}" placeholder="RAW-0001 (auto if blank)" />`)}
       ${fieldset('Brand', `<input class="input" name="brand" value="${escapeHtml(existing.brand || '')}" />`)}
       ${fieldset('Category', `<input class="input" name="category" value="${escapeHtml(existing.category || '')}" placeholder="RAW ING, SUPPLIES, SUB-RECIPE…" />`)}
       ${fieldset('Subcategory', `<input class="input" name="subcategory" value="${escapeHtml(existing.subcategory || '')}" placeholder="Protein, Produce, Dairy…" />`)}
-      ${fieldset('Default supplier', `<select class="input" name="default_supplier_id">
-        <option value="">— none —</option>
+      ${fieldset('Base unit *', `<input class="input" name="unit" value="${escapeHtml(existing.unit || '')}" placeholder="g, ml, pc…" required />`)}
+      ${fieldset('Yield %', `<input class="input" type="number" step="any" name="yield_pct" value="${existing.yield_pct || 100}" title="Usable % after trim. 100 = no loss." />`)}
+      ${fieldset('Preferred supplier', `<select class="input" name="default_supplier_id">
+        <option value="">— none (use cheapest) —</option>
         ${suppliers.map(s => `<option value="${s.id}" ${existing.default_supplier_id === s.id ? 'selected' : ''}>${escapeHtml(s.name)}</option>`).join('')}
       </select>`)}
     </div>
+
     <div class="bg-slate-50 border border-slate-200 rounded-lg p-3 my-3">
-      <div class="text-xs font-medium text-slate-600 uppercase tracking-wide mb-2">Pack / Pricing</div>
-      <div class="grid grid-cols-3 gap-3">
-        ${fieldset('Pack size', `<input class="input" name="pack_size" value="${escapeHtml(existing.pack_size || '')}" placeholder="1 KG, 1 GAL…" />`)}
-        ${fieldset('Pack qty (base units)', `<input class="input" type="number" step="any" name="pack_qty" value="${existing.pack_qty || 0}" placeholder="e.g. 1000" />`)}
-        ${fieldset('Pack cost ₱', `<input class="input" type="number" step="any" name="pack_cost" value="${existing.pack_cost || 0}" />`)}
-        ${fieldset('Base unit *', `<input class="input" name="unit" value="${escapeHtml(existing.unit || '')}" placeholder="g, ml, pc…" required />`)}
-        ${fieldset('Yield %', `<input class="input" type="number" step="any" name="yield_pct" value="${existing.yield_pct || 100}" placeholder="100" title="Usable % after trim. 100 = no loss." />`)}
-        ${fieldset('Barcode', `<input class="input" name="barcode" value="${escapeHtml(existing.barcode || '')}" />`)}
+      <div class="flex justify-between items-center mb-2">
+        <div class="text-xs font-medium text-slate-600 uppercase tracking-wide">Suppliers &amp; Prices</div>
+        <button class="btn btn-secondary text-xs" id="add-price">+ Add supplier price</button>
       </div>
+      <table class="border border-slate-200 rounded bg-white">
+        <thead><tr><th>Supplier</th><th>Pack</th><th class="text-right">Pack qty</th><th class="text-right">Pack cost</th><th class="text-right">Effective ₱/unit</th><th></th></tr></thead>
+        <tbody id="prices-tbody">
+          ${prices.map(priceRowHtml).join('')}
+        </tbody>
+      </table>
+      <p class="text-xs text-slate-500 mt-2">Effective ₱/unit = pack_cost ÷ (pack_qty × yield%). Changing a price creates a new history row; cosmetic edits patch in place.</p>
     </div>
-    <div class="grid grid-cols-3 gap-3">
+
+    <div class="grid grid-cols-4 gap-3">
       ${fieldset('Par level', `<input class="input" type="number" step="any" name="par_level" value="${existing.par_level || 0}" />`)}
       ${fieldset('Reorder point', `<input class="input" type="number" step="any" name="reorder_point" value="${existing.reorder_point || 0}" />`)}
       ${fieldset('Reorder qty', `<input class="input" type="number" step="any" name="reorder_qty" value="${existing.reorder_qty || 0}" />`)}
+      ${fieldset('Barcode', `<input class="input" name="barcode" value="${escapeHtml(existing.barcode || '')}" />`)}
     </div>
     ${fieldset('Notes', `<textarea class="input" rows="2" name="notes">${escapeHtml(existing.notes || '')}</textarea>`)}
     <label class="inline-flex items-center gap-2 text-sm"><input type="checkbox" name="active" ${existing.id === undefined || existing.active ? 'checked' : ''} /> Active</label>
@@ -623,31 +656,71 @@ async function openItemModal(id) {
       <button class="btn btn-secondary" data-cancel>Cancel</button>
       <button class="btn btn-primary" data-save>Save</button>
     </div>`;
+
   await modal(html, {
     title: id ? 'Edit item' : 'New item',
     onMount: (m, close) => {
+      const tbody = m.querySelector('#prices-tbody');
+      const yieldInput = m.querySelector('[name="yield_pct"]');
+      let counter = prices.length;
+
+      const recalcUnitCosts = () => {
+        const y = (Number(yieldInput.value) || 100) / 100;
+        tbody.querySelectorAll('tr').forEach(tr => {
+          const q = Number(tr.querySelector('[data-f="pack_qty"]').value) || 0;
+          const c = Number(tr.querySelector('[data-f="pack_cost"]').value) || 0;
+          tr.querySelector('.unit-cost-cell').textContent =
+            (q > 0 && c > 0) ? fmtMoney(c / (q * y)) : '—';
+        });
+      };
+      const bindRow = (tr) => {
+        tr.querySelectorAll('input, select').forEach(el => el.oninput = recalcUnitCosts);
+        tr.querySelector('[data-rm]').onclick = () => { tr.remove(); recalcUnitCosts(); };
+      };
+      tbody.querySelectorAll('tr').forEach(bindRow);
+      yieldInput.oninput = recalcUnitCosts;
+      recalcUnitCosts();
+
+      m.querySelector('#add-price').onclick = () => {
+        const div = document.createElement('tbody');
+        div.innerHTML = priceRowHtml({ supplier_id: '', pack_size: '', pack_qty: '', pack_cost: '' }, counter++);
+        const tr = div.querySelector('tr');
+        tbody.appendChild(tr);
+        bindRow(tr);
+        recalcUnitCosts();
+      };
+
       m.querySelector('[data-cancel]').onclick = () => close(null);
       m.querySelector('[data-save]').onclick = async () => {
         const get = (n) => m.querySelector(`[name="${n}"]`).value;
+        // Gather prices from the table
+        const pricesOut = Array.from(tbody.querySelectorAll('tr')).map((tr, i) => ({
+          id: prices[Number(tr.dataset.pidx)] ? prices[Number(tr.dataset.pidx)].id : undefined,
+          supplier_id: tr.querySelector('[data-f="supplier_id"]').value,
+          pack_size: tr.querySelector('[data-f="pack_size"]').value,
+          pack_qty: Number(tr.querySelector('[data-f="pack_qty"]').value) || 0,
+          pack_cost: Number(tr.querySelector('[data-f="pack_cost"]').value) || 0
+        })).filter(p => p.supplier_id && p.pack_qty > 0 && p.pack_cost >= 0);
+
         const payload = {
-          id: id,
-          sku: get('sku'), name: get('name'),
-          category: get('category'), subcategory: get('subcategory'),
-          unit: get('unit'),
-          brand: get('brand'),
-          pack_size: get('pack_size'),
-          pack_qty: Number(get('pack_qty')) || 0,
-          pack_cost: Number(get('pack_cost')) || 0,
-          default_supplier_id: get('default_supplier_id'),
-          yield_pct: Number(get('yield_pct')) || 100,
-          par_level: Number(get('par_level')),
-          reorder_point: Number(get('reorder_point')),
-          reorder_qty: Number(get('reorder_qty')),
-          barcode: get('barcode'), notes: get('notes'),
-          active: m.querySelector('[name="active"]').checked
+          item: {
+            id: id,
+            sku: get('sku'), name: get('name'),
+            category: get('category'), subcategory: get('subcategory'),
+            unit: get('unit'),
+            brand: get('brand'),
+            default_supplier_id: get('default_supplier_id'),
+            yield_pct: Number(get('yield_pct')) || 100,
+            par_level: Number(get('par_level')),
+            reorder_point: Number(get('reorder_point')),
+            reorder_qty: Number(get('reorder_qty')),
+            barcode: get('barcode'), notes: get('notes'),
+            active: m.querySelector('[name="active"]').checked
+          },
+          prices: pricesOut
         };
         try {
-          await api('items.upsert', payload);
+          await api('items.upsertWithPrices', payload);
           toast('Saved', 'success');
           close(true);
           bootRefresh();
@@ -1378,11 +1451,12 @@ function viewImport(root) {
         <code class="text-xs">ITEM, PACK, PACK COST, BASE UNIT, UNIT QTY, COST PER G/ML/PC, BRAND, SUPPLIER, TYPE, NOTES</code>.
       </p>
       <ul class="text-xs text-slate-600 mb-2 list-disc pl-5 space-y-1">
-        <li>Items are uniquely identified by <b>ITEM + SUPPLIER</b>, so per-supplier rows stay separate</li>
+        <li>Rows are <b>grouped by ITEM name</b> (case + whitespace insensitive). All "ALL PURPOSE FLOUR" rows become ONE item with multiple supplier prices.</li>
         <li>Suppliers not yet in the system are <b>auto-created</b></li>
-        <li>Identical duplicate rows are skipped (with a notice)</li>
+        <li>SKUs are <b>auto-generated</b> per category (RAW-0001, SUP-0001, SUB-0001…)</li>
+        <li>If rows for the same name have different category/unit/brand, the <b>first row wins</b> and the conflict is flagged</li>
         <li>₱ symbols and comma thousands separators are stripped automatically</li>
-        <li>No opening stock is posted — this file is a catalog. Use stock counts later to set opening balances.</li>
+        <li>No opening stock posted — this is a catalog. Use stock counts later to set opening balances.</li>
       </ul>
       <details class="text-xs text-slate-500 mb-3"><summary class="cursor-pointer">Show sample (your format)</summary><pre class="bg-slate-50 p-3 rounded overflow-x-auto mt-2">${escapeHtml(masterSample)}</pre></details>
       <textarea id="csv-text" class="input font-mono text-xs" rows="10" placeholder="Paste your master list CSV here…"></textarea>
@@ -1426,8 +1500,8 @@ function renderCsvReport(parsed, report, isDryRun) {
       <div class="grid grid-cols-2 sm:grid-cols-5 gap-3 mb-4">
         <div class="border border-slate-200 rounded p-3"><div class="text-xs text-slate-500">${verb} create items</div><div class="font-bold">${report.created}</div></div>
         <div class="border border-slate-200 rounded p-3"><div class="text-xs text-slate-500">${verb} update items</div><div class="font-bold">${report.updated}</div></div>
+        <div class="border border-slate-200 rounded p-3"><div class="text-xs text-slate-500">Supplier prices</div><div class="font-bold">${report.prices_added || 0}</div></div>
         <div class="border border-slate-200 rounded p-3"><div class="text-xs text-slate-500">${verb} auto-create suppliers</div><div class="font-bold">${report.suppliers_created || 0}</div></div>
-        <div class="border border-slate-200 rounded p-3"><div class="text-xs text-slate-500">Opening stock txns</div><div class="font-bold">${report.opening_posted || 0}</div></div>
         <div class="border border-slate-200 rounded p-3 ${report.errors.length ? 'border-rose-300 bg-rose-50' : ''}"><div class="text-xs text-slate-500">Errors / notices</div><div class="font-bold ${report.errors.length ? 'text-rose-600' : ''}">${report.errors.length}</div></div>
       </div>
       ${report.errors.length ? `
