@@ -743,7 +743,10 @@ function viewSuppliers(root) {
   root.innerHTML = `
     <div class="flex justify-between items-center mb-4">
       <input id="sup-q" class="input max-w-sm" placeholder="Search…" />
-      ${can('manager') ? '<button class="btn btn-primary" id="new-sup">+ New supplier</button>' : ''}
+      <div class="flex gap-2">
+        ${can('admin') ? '<button class="btn btn-ghost text-rose-600 text-xs" id="wipe-suppliers" title="Delete all suppliers + prices. Refuses if any POs exist.">Wipe all</button>' : ''}
+        ${can('manager') ? '<button class="btn btn-primary" id="new-sup">+ New supplier</button>' : ''}
+      </div>
     </div>
     <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
       <table>
@@ -774,6 +777,11 @@ function viewSuppliers(root) {
   };
   document.getElementById('sup-q').oninput = (e) => render(e.target.value);
   if (can('manager')) document.getElementById('new-sup').onclick = () => openSupplierModal();
+  if (can('admin')) document.getElementById('wipe-suppliers').onclick = async () => {
+    if (!(await confirmDialog('Wipe ALL suppliers + supplier prices? Items lose their default-supplier link. Refuses if any POs exist.'))) return;
+    try { const r = await api('suppliers.wipeAll', {}); toast(r, 'success'); bootRefresh(); }
+    catch (e) { toast(e.message, 'error'); }
+  };
   render('');
 }
 
@@ -863,16 +871,46 @@ function viewPOs(root) {
 
 async function openPOEditor(id) {
   // suppliers + items come from the bootstrap snapshot; only PO lines need a fresh fetch.
-  const suppliers = state.boot.suppliers;
-  const items = state.boot.items;
+  const suppliers = (state.boot.suppliers || []).filter(s => s.active);
+  const items = state.boot.items || [];
+  if (!suppliers.length) {
+    toast('Add at least one active supplier first', 'error');
+    return;
+  }
+  if (!items.length) {
+    toast('Add at least one item first', 'error');
+    return;
+  }
   const existing = id ? await api('po.get', { id }) : null;
   const lines = existing ? existing.lines.map(l => ({ ...l })) : [];
+
+  // If any PO line references a deleted item, include a synthetic option so the dropdown
+  // shows it instead of silently swapping it to the first item on save.
+  const itemById = {};
+  items.forEach(i => { itemById[i.id] = i; });
+  const ghostItems = [];
+  lines.forEach(l => {
+    if (l.item_id && !itemById[l.item_id]) {
+      ghostItems.push({ id: l.item_id, name: '(deleted) ' + (l.item_name || l.item_id), unit: l.unit || '' });
+    }
+  });
+  const allItemOptions = ghostItems.concat(items);
+
+  // Look up best supplier-specific unit cost for (item, supplier).
+  // Returns cost per ONE base unit (pack_cost / pack_qty), suitable for the PO line unit_cost field.
+  const supplierPriceFor = (itemId, supplierId) => {
+    const it = itemById[itemId];
+    if (!it || !it.supplier_prices || !supplierId) return null;
+    const sp = it.supplier_prices.find(p => p.supplier_id === supplierId);
+    if (!sp || !sp.pack_qty) return null;
+    return sp.pack_cost / sp.pack_qty;
+  };
 
   const lineRowHtml = (l, idx) => `
     <tr data-line="${idx}">
       <td>
         <select class="input" data-field="item_id">
-          ${items.map(it => `<option value="${it.id}" ${l.item_id === it.id ? 'selected' : ''}>${escapeHtml(it.name)} (${escapeHtml(it.unit)})</option>`).join('')}
+          ${allItemOptions.map(it => `<option value="${it.id}" ${l.item_id === it.id ? 'selected' : ''}>${escapeHtml(it.name)} (${escapeHtml(it.unit || '')})</option>`).join('')}
         </select>
       </td>
       <td><input class="input text-right" type="number" step="any" data-field="qty_ordered" value="${l.qty_ordered || 1}" /></td>
@@ -936,20 +974,43 @@ async function openPOEditor(id) {
       };
       const addLine = (data) => {
         const idx = counter++;
-        const tr = document.createElement('tr');
-        tr.innerHTML = lineRowHtml(data || { item_id: items[0] && items[0].id, qty_ordered: 1, unit_cost: 0 }, idx);
-        tbody.appendChild(tr.firstElementChild);
-        bindRow(tbody.lastElementChild);
+        // Use a tbody wrapper so the browser parses <tr>...</tr> correctly.
+        // (Setting tr.innerHTML = '<tr>...</tr>' strips the inner tags and only the first
+        //  <td> ends up as a child — which is why the row showed item dropdown but no qty/cost/total.)
+        const wrap = document.createElement('tbody');
+        wrap.innerHTML = lineRowHtml(data || { item_id: items[0] && items[0].id, qty_ordered: 1, unit_cost: 0 }, idx);
+        const tr = wrap.firstElementChild;
+        tbody.appendChild(tr);
+        bindRow(tr);
         recalc();
+      };
+      // Auto-fill unit_cost from the supplier's price for this item, if one exists.
+      // Only overwrites when the field is empty/zero — never clobbers a user's manual entry.
+      const autoFillCost = (tr) => {
+        const itemId = tr.querySelector('[data-field="item_id"]').value;
+        const supId = m.querySelector('[name="supplier_id"]').value;
+        const costInput = tr.querySelector('[data-field="unit_cost"]');
+        if (Number(costInput.value) > 0) return;  // respect manual entry
+        const c = supplierPriceFor(itemId, supId);
+        if (c != null) costInput.value = c.toFixed(4);
       };
       const bindRow = (tr) => {
         tr.querySelectorAll('input, select').forEach(el => el.oninput = recalc);
+        // Item change → try to auto-fill from supplier price
+        tr.querySelector('[data-field="item_id"]').addEventListener('change', () => { autoFillCost(tr); recalc(); });
         tr.querySelector('[data-rm]').onclick = () => { tr.remove(); recalc(); };
       };
       tbody.querySelectorAll('tr').forEach(bindRow);
+      // Supplier change → try to auto-fill cost for every line that's still empty
+      m.querySelector('[name="supplier_id"]').addEventListener('change', () => {
+        tbody.querySelectorAll('tr').forEach(autoFillCost);
+        recalc();
+      });
       m.querySelector('[name="tax"]').oninput = recalc;
       m.querySelector('#add-line').onclick = () => addLine();
       if (!lines.length) addLine();
+      // For newly-created rows on first open, try to auto-fill if supplier already chosen
+      tbody.querySelectorAll('tr').forEach(autoFillCost);
       recalc();
 
       m.querySelector('[data-cancel]').onclick = () => close(null);
