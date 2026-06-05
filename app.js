@@ -16,11 +16,13 @@ const ROUTES = [
   { hash: 'inventory',  title: 'Inventory',        icon: '◉', view: viewInventory,  min: 'viewer' },
   { hash: 'lowstock',   title: 'Low Stock',        icon: '!', view: viewLowStock,   min: 'viewer' },
   { hash: 'items',      title: 'Items',            icon: '◆', view: viewItems,      min: 'viewer' },
+  { hash: 'locations',  title: 'Locations',        icon: '⌂', view: viewLocations,  min: 'viewer' },
   { hash: 'suppliers',  title: 'Suppliers',        icon: '▤', view: viewSuppliers,  min: 'viewer' },
   { hash: 'po',         title: 'Purchase Orders',  icon: '▷', view: viewPOs,        min: 'viewer' },
   { hash: 'receiving',  title: 'Receiving',        icon: '↓', view: viewReceiving,  min: 'receiver' },
   { hash: 'ledger',     title: 'Ledger',           icon: '≡', view: viewLedger,     min: 'viewer' },
   { hash: 'counts',     title: 'Stock Counts',     icon: '☑', view: viewCounts,     min: 'viewer' },
+  { hash: 'import',     title: 'Import',           icon: '⇪', view: viewImport,     min: 'manager' },
   { hash: 'users',      title: 'Users',            icon: '☻', view: viewUsers,      min: 'admin'  }
 ];
 
@@ -371,18 +373,36 @@ function kpiCard(label, value, sub, tone = 'brand') {
 
 function viewInventory(root) {
   const rows = state.boot.onHand;
+  const byLoc = state.boot.onHandByLocation || [];
+  const locs = state.boot.locations || [];
   const totalValue = rows.reduce((s, r) => s + (r.value || 0), 0);
+  // Per-location totals for the chip strip
+  const locTotals = {};
+  byLoc.forEach(r => { locTotals[r.location_id] = (locTotals[r.location_id] || 0) + (r.value || 0); });
   root.innerHTML = `
-    <div class="bg-white rounded-xl shadow-sm border border-slate-200">
-      <div class="px-5 py-3 border-b border-slate-200 flex items-center justify-between">
-        <div>
-          <h3 class="font-semibold">On-hand inventory</h3>
-          <p class="text-xs text-slate-500">Quantities derived from the inventory ledger. WAC = weighted average cost.</p>
-        </div>
+    <div class="bg-white rounded-xl shadow-sm border border-slate-200 mb-4 p-4">
+      <div class="flex items-center justify-between mb-2">
+        <h3 class="font-semibold">Value by location</h3>
         <div class="text-right">
           <div class="text-xs text-slate-500">Total value</div>
           <div class="font-bold text-lg">${fmtMoney(totalValue)}</div>
         </div>
+      </div>
+      <div class="flex flex-wrap gap-2">
+        ${locs.filter(l => l.active).map(l => `
+          <div class="border border-slate-200 rounded-lg px-3 py-2 min-w-[8rem]">
+            <div class="text-xs text-slate-500">${escapeHtml(l.name)}</div>
+            <div class="font-semibold">${fmtMoney(locTotals[l.id] || 0)}</div>
+          </div>`).join('') || '<div class="text-xs text-slate-400">No active locations yet.</div>'}
+      </div>
+    </div>
+    <div class="bg-white rounded-xl shadow-sm border border-slate-200">
+      <div class="px-5 py-3 border-b border-slate-200 flex items-center justify-between gap-3">
+        <h3 class="font-semibold">On-hand inventory</h3>
+        <select id="inv-loc-filter" class="input max-w-xs">
+          <option value="">All locations (totals)</option>
+          ${locs.filter(l => l.active).map(l => `<option value="${l.id}">${escapeHtml(l.name)}</option>`).join('')}
+        </select>
       </div>
       <table>
         <thead><tr>
@@ -390,28 +410,47 @@ function viewInventory(root) {
           <th class="text-right">On hand</th><th class="text-right">Avg cost</th><th class="text-right">Value</th>
           <th></th>
         </tr></thead>
-        <tbody>
-          ${rows.length === 0
-            ? '<tr><td colspan="7" class="text-center text-slate-400 py-6">No items</td></tr>'
-            : rows.map(r => `
-              <tr>
-                <td class="text-slate-500">${escapeHtml(r.sku)}</td>
-                <td class="font-medium">${escapeHtml(r.name)}</td>
-                <td class="text-slate-500">${escapeHtml(r.unit)}</td>
-                <td class="text-right ${r.on_hand < 0 ? 'text-rose-600' : ''}">${fmtNum(r.on_hand)}</td>
-                <td class="text-right">${fmtMoney(r.avg_cost)}</td>
-                <td class="text-right font-medium">${fmtMoney(r.value)}</td>
-                <td class="text-right">${can('manager')
-                  ? `<button class="btn btn-ghost text-xs" data-adj="${r.item_id}">Adjust</button>`
-                  : ''}</td>
-              </tr>`).join('')}
-        </tbody>
+        <tbody id="inv-tbody"></tbody>
       </table>
     </div>
   `;
-  root.querySelectorAll('[data-adj]').forEach(btn => {
-    btn.onclick = () => openAdjustModal(btn.dataset.adj);
-  });
+  const itemById = {};
+  rows.forEach(r => { itemById[r.item_id] = r; });
+  const render = () => {
+    const locId = document.getElementById('inv-loc-filter').value;
+    let displayRows;
+    if (!locId) {
+      displayRows = rows;
+    } else {
+      // Filter to per-location qty/value for the chosen location.
+      displayRows = byLoc.filter(b => b.location_id === locId).map(b => {
+        const meta = itemById[b.item_id] || { sku: '', name: '(unknown)', unit: '' };
+        return {
+          item_id: b.item_id, sku: meta.sku, name: meta.name, unit: meta.unit,
+          on_hand: b.qty, avg_cost: b.avg_cost, value: b.value
+        };
+      }).sort((a, b) => a.name.localeCompare(b.name));
+    }
+    document.getElementById('inv-tbody').innerHTML = displayRows.length === 0
+      ? '<tr><td colspan="7" class="text-center text-slate-400 py-6">No items</td></tr>'
+      : displayRows.map(r => `
+        <tr>
+          <td class="text-slate-500">${escapeHtml(r.sku)}</td>
+          <td class="font-medium">${escapeHtml(r.name)}</td>
+          <td class="text-slate-500">${escapeHtml(r.unit)}</td>
+          <td class="text-right ${r.on_hand < 0 ? 'text-rose-600' : ''}">${fmtNum(r.on_hand)}</td>
+          <td class="text-right">${fmtMoney(r.avg_cost)}</td>
+          <td class="text-right font-medium">${fmtMoney(r.value)}</td>
+          <td class="text-right">${can('manager')
+            ? `<button class="btn btn-ghost text-xs" data-adj="${r.item_id}">Adjust</button>`
+            : ''}</td>
+        </tr>`).join('');
+    document.querySelectorAll('[data-adj]').forEach(btn => {
+      btn.onclick = () => openAdjustModal(btn.dataset.adj);
+    });
+  };
+  document.getElementById('inv-loc-filter').onchange = render;
+  render();
 }
 
 async function openAdjustModal(itemId) {
@@ -419,10 +458,14 @@ async function openAdjustModal(itemId) {
   const itemMeta = state.boot.items.find(i => i.id === itemId) || {};
   const stock = state.boot.onHand.find(o => o.item_id === itemId) || {};
   const item = { ...itemMeta, on_hand: stock.on_hand || 0, avg_cost: stock.avg_cost || 0 };
+  const locs = (state.boot.locations || []).filter(l => l.active);
   const html = `
     <div class="text-sm text-slate-600 mb-3">
       Adjusting <b>${escapeHtml(item.name)}</b> — current on hand: <b>${fmtNum(item.on_hand)} ${escapeHtml(item.unit)}</b>
     </div>
+    ${fieldset('Location', `<select class="input" name="location_id">
+      ${locs.map(l => `<option value="${l.id}">${escapeHtml(l.name)}</option>`).join('')}
+    </select>`)}
     ${fieldset('Type', `<select class="input" name="type">
       <option value="adjustment">Adjustment</option>
       <option value="waste">Waste</option>
@@ -443,6 +486,7 @@ async function openAdjustModal(itemId) {
         try {
           await api('inv.adjust', {
             item_id: itemId,
+            location_id: get('location_id'),
             type: get('type'),
             qty: Number(get('qty')),
             unit_cost: get('unit_cost') === '' ? undefined : Number(get('unit_cost')),
@@ -491,15 +535,19 @@ function viewLowStock(root) {
 function viewItems(root) {
   const rows = state.boot.items;
   root.innerHTML = `
-    <div class="flex justify-between items-center mb-4">
-      <input id="items-q" class="input max-w-sm" placeholder="Search by name, SKU, category…" />
+    <div class="flex justify-between items-center mb-4 gap-2">
+      <input id="items-q" class="input max-w-sm" placeholder="Search by name, brand, supplier, category…" />
       ${can('manager') ? '<button class="btn btn-primary" id="new-item">+ New item</button>' : ''}
     </div>
-    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-auto">
       <table>
         <thead><tr>
-          <th>SKU</th><th>Name</th><th>Category</th><th>Unit</th>
-          <th class="text-right">On hand</th><th class="text-right">Reorder</th><th class="text-right">WAC</th>
+          <th>Name</th><th>Brand</th><th>Category</th>
+          <th>Pack</th><th>Unit</th><th>Supplier</th>
+          <th class="text-right">Pack cost</th>
+          <th class="text-right">Ref ₱/unit</th>
+          <th class="text-right">On hand</th>
+          <th class="text-right">WAC</th>
           <th></th>
         </tr></thead>
         <tbody id="items-tbody"></tbody>
@@ -508,20 +556,23 @@ function viewItems(root) {
   const render = (filter) => {
     const q = (filter || '').toLowerCase();
     const filtered = rows.filter(r =>
-      !q || (r.name + ' ' + r.sku + ' ' + r.category).toLowerCase().includes(q)
+      !q || (r.name + ' ' + r.sku + ' ' + r.brand + ' ' + r.category + ' ' + r.default_supplier_name).toLowerCase().includes(q)
     );
     document.getElementById('items-tbody').innerHTML = filtered.length === 0
-      ? '<tr><td colspan="8" class="text-center text-slate-400 py-6">No items</td></tr>'
+      ? '<tr><td colspan="11" class="text-center text-slate-400 py-6">No items</td></tr>'
       : filtered.map(r => `
         <tr>
-          <td class="text-slate-500">${escapeHtml(r.sku)}</td>
-          <td class="font-medium">${escapeHtml(r.name)} ${!r.active ? '<span class="badge bg-slate-100 text-slate-500 ml-1">inactive</span>' : ''}</td>
-          <td class="text-slate-500">${escapeHtml(r.category)}</td>
+          <td class="font-medium">${escapeHtml(r.name)} ${!r.active ? '<span class="badge bg-slate-100 text-slate-500 ml-1">inactive</span>' : ''} ${r.sku ? `<span class="text-xs text-slate-400 ml-1">${escapeHtml(r.sku)}</span>` : ''}</td>
+          <td class="text-slate-500">${escapeHtml(r.brand)}</td>
+          <td class="text-slate-500">${escapeHtml(r.category)}${r.subcategory ? ' / ' + escapeHtml(r.subcategory) : ''}</td>
+          <td class="text-slate-500 whitespace-nowrap">${escapeHtml(r.pack_size)}${r.pack_qty ? ` <span class="text-xs text-slate-400">(${fmtNum(r.pack_qty)})</span>` : ''}</td>
           <td class="text-slate-500">${escapeHtml(r.unit)}</td>
+          <td class="text-slate-500">${escapeHtml(r.default_supplier_name)}</td>
+          <td class="text-right text-slate-500">${r.pack_cost ? fmtMoney(r.pack_cost) : ''}</td>
+          <td class="text-right text-slate-500">${r.ref_unit_cost ? fmtMoney(r.ref_unit_cost) : ''}</td>
           <td class="text-right">${fmtNum(r.on_hand)}</td>
-          <td class="text-right text-slate-500">${fmtNum(r.reorder_point)}</td>
           <td class="text-right">${fmtMoney(r.avg_cost)}</td>
-          <td class="text-right">
+          <td class="text-right whitespace-nowrap">
             ${can('manager') ? `<button class="btn btn-ghost text-xs" data-edit="${r.id}">Edit</button>` : ''}
             ${can('manager') ? `<button class="btn btn-ghost text-xs text-rose-600" data-del="${r.id}">Del</button>` : ''}
           </td>
@@ -537,16 +588,34 @@ function viewItems(root) {
 async function openItemModal(id) {
   // Read from bootstrap cache instead of a fresh items.get round-trip.
   const existing = id ? (state.boot.items.find(i => i.id === id) || {}) : {};
+  const suppliers = (state.boot.suppliers || []).filter(s => s.active);
   const html = `
     <div class="grid grid-cols-2 gap-3">
-      ${fieldset('SKU', `<input class="input" name="sku" value="${escapeHtml(existing.sku || '')}" />`)}
       ${fieldset('Name *', `<input class="input" name="name" value="${escapeHtml(existing.name || '')}" required />`)}
-      ${fieldset('Category', `<input class="input" name="category" value="${escapeHtml(existing.category || '')}" />`)}
-      ${fieldset('Unit *', `<input class="input" name="unit" value="${escapeHtml(existing.unit || '')}" placeholder="kg, pc, L…" required />`)}
+      ${fieldset('SKU', `<input class="input" name="sku" value="${escapeHtml(existing.sku || '')}" placeholder="optional" />`)}
+      ${fieldset('Brand', `<input class="input" name="brand" value="${escapeHtml(existing.brand || '')}" />`)}
+      ${fieldset('Category', `<input class="input" name="category" value="${escapeHtml(existing.category || '')}" placeholder="RAW ING, SUPPLIES, SUB-RECIPE…" />`)}
+      ${fieldset('Subcategory', `<input class="input" name="subcategory" value="${escapeHtml(existing.subcategory || '')}" placeholder="Protein, Produce, Dairy…" />`)}
+      ${fieldset('Default supplier', `<select class="input" name="default_supplier_id">
+        <option value="">— none —</option>
+        ${suppliers.map(s => `<option value="${s.id}" ${existing.default_supplier_id === s.id ? 'selected' : ''}>${escapeHtml(s.name)}</option>`).join('')}
+      </select>`)}
+    </div>
+    <div class="bg-slate-50 border border-slate-200 rounded-lg p-3 my-3">
+      <div class="text-xs font-medium text-slate-600 uppercase tracking-wide mb-2">Pack / Pricing</div>
+      <div class="grid grid-cols-3 gap-3">
+        ${fieldset('Pack size', `<input class="input" name="pack_size" value="${escapeHtml(existing.pack_size || '')}" placeholder="1 KG, 1 GAL…" />`)}
+        ${fieldset('Pack qty (base units)', `<input class="input" type="number" step="any" name="pack_qty" value="${existing.pack_qty || 0}" placeholder="e.g. 1000" />`)}
+        ${fieldset('Pack cost ₱', `<input class="input" type="number" step="any" name="pack_cost" value="${existing.pack_cost || 0}" />`)}
+        ${fieldset('Base unit *', `<input class="input" name="unit" value="${escapeHtml(existing.unit || '')}" placeholder="g, ml, pc…" required />`)}
+        ${fieldset('Yield %', `<input class="input" type="number" step="any" name="yield_pct" value="${existing.yield_pct || 100}" placeholder="100" title="Usable % after trim. 100 = no loss." />`)}
+        ${fieldset('Barcode', `<input class="input" name="barcode" value="${escapeHtml(existing.barcode || '')}" />`)}
+      </div>
+    </div>
+    <div class="grid grid-cols-3 gap-3">
       ${fieldset('Par level', `<input class="input" type="number" step="any" name="par_level" value="${existing.par_level || 0}" />`)}
       ${fieldset('Reorder point', `<input class="input" type="number" step="any" name="reorder_point" value="${existing.reorder_point || 0}" />`)}
       ${fieldset('Reorder qty', `<input class="input" type="number" step="any" name="reorder_qty" value="${existing.reorder_qty || 0}" />`)}
-      ${fieldset('Barcode', `<input class="input" name="barcode" value="${escapeHtml(existing.barcode || '')}" />`)}
     </div>
     ${fieldset('Notes', `<textarea class="input" rows="2" name="notes">${escapeHtml(existing.notes || '')}</textarea>`)}
     <label class="inline-flex items-center gap-2 text-sm"><input type="checkbox" name="active" ${existing.id === undefined || existing.active ? 'checked' : ''} /> Active</label>
@@ -562,8 +631,15 @@ async function openItemModal(id) {
         const get = (n) => m.querySelector(`[name="${n}"]`).value;
         const payload = {
           id: id,
-          sku: get('sku'), name: get('name'), category: get('category'),
+          sku: get('sku'), name: get('name'),
+          category: get('category'), subcategory: get('subcategory'),
           unit: get('unit'),
+          brand: get('brand'),
+          pack_size: get('pack_size'),
+          pack_qty: Number(get('pack_qty')) || 0,
+          pack_cost: Number(get('pack_cost')) || 0,
+          default_supplier_id: get('default_supplier_id'),
+          yield_pct: Number(get('yield_pct')) || 100,
           par_level: Number(get('par_level')),
           reorder_point: Number(get('reorder_point')),
           reorder_qty: Number(get('reorder_qty')),
@@ -921,8 +997,12 @@ function viewReceiving(root) {
 
 async function openReceiveModal(poId) {
   const preview = await api('receive.preview', { po_id: poId });
+  const locs = (state.boot.locations || []).filter(l => l.active);
   const html = `
     <p class="text-sm text-slate-600 mb-2">PO <b>${escapeHtml(preview.po_number)}</b> — enter the quantity received now per line. Leave 0 to skip.</p>
+    ${fieldset('Destination location (applies to all lines)', `<select class="input max-w-xs" name="po_location_id">
+      ${locs.map(l => `<option value="${l.id}">${escapeHtml(l.name)}</option>`).join('')}
+    </select>`)}
     <table class="border border-slate-200 rounded">
       <thead><tr><th>Item</th><th class="text-right">Outstanding</th><th class="text-right">Receive now</th><th class="text-right">Unit cost</th></tr></thead>
       <tbody>
@@ -951,7 +1031,11 @@ async function openReceiveModal(poId) {
         })).filter(l => l.qty_received_now > 0);
         if (!lines.length) { toast('Nothing to receive', 'error'); return; }
         try {
-          const res = await api('receive.post', { po_id: poId, lines });
+          const res = await api('receive.post', {
+            po_id: poId,
+            location_id: m.querySelector('[name="po_location_id"]').value,
+            lines
+          });
           toast(`Posted ${res.txn_count} receipt(s) — PO now ${res.status}`, 'success');
           close(true);
           bootRefresh();
@@ -1034,8 +1118,25 @@ function viewCounts(root) {
       </table>
     </div>`;
   if (can('manager')) document.getElementById('new-count').onclick = async () => {
-    if (!(await confirmDialog('Start a new stock count? This snapshots current system quantities for every active item.'))) return;
-    try { const r = await api('count.create', {}); toast('Count started', 'success'); openCountModal(r.id); bootRefresh(); }
+    const locs = (state.boot.locations || []).filter(l => l.active);
+    if (!locs.length) { toast('Create a location first', 'error'); return; }
+    // Quick picker for which location to count
+    const picked = await modal(`
+      <p class="text-sm text-slate-600 mb-2">Pick a location to count. Lines will be seeded from current system qty at that location.</p>
+      ${fieldset('Location', `<select class="input" name="loc">${locs.map(l => `<option value="${l.id}">${escapeHtml(l.name)}</option>`).join('')}</select>`)}
+      <div class="flex justify-end gap-2 mt-4">
+        <button class="btn btn-secondary" data-cancel>Cancel</button>
+        <button class="btn btn-primary" data-ok>Start count</button>
+      </div>
+    `, {
+      title: 'New stock count',
+      onMount: (m, close) => {
+        m.querySelector('[data-cancel]').onclick = () => close(null);
+        m.querySelector('[data-ok]').onclick = () => close(m.querySelector('[name="loc"]').value);
+      }
+    });
+    if (!picked) return;
+    try { const r = await api('count.create', { location_id: picked }); toast('Count started', 'success'); openCountModal(r.id); bootRefresh(); }
     catch (e) { toast(e.message, 'error'); }
   };
   root.querySelectorAll('[data-open]').forEach(b => b.onclick = () => openCountModal(b.dataset.open));
@@ -1189,6 +1290,198 @@ async function deleteUser(id) {
   if (!(await confirmDialog('Remove this user? They will lose access.'))) return;
   try { await api('users.delete', { id }); toast('Removed', 'success'); bootRefresh(); }
   catch (e) { toast(e.message, 'error'); }
+}
+
+// ---------- Locations ----------
+
+function viewLocations(root) {
+  const rows = state.boot.locations || [];
+  root.innerHTML = `
+    <div class="flex justify-between items-center mb-4">
+      <p class="text-sm text-slate-500">Storage zones inside this restaurant. Each receive / adjust / count picks a location.</p>
+      ${can('manager') ? '<button class="btn btn-primary" id="new-loc">+ New location</button>' : ''}
+    </div>
+    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+      <table>
+        <thead><tr><th>Name</th><th>Type</th><th>Notes</th><th>Active</th><th></th></tr></thead>
+        <tbody>
+          ${rows.length === 0
+            ? '<tr><td colspan="5" class="text-center text-slate-400 py-6">No locations yet</td></tr>'
+            : rows.map(r => `
+              <tr>
+                <td class="font-medium">${escapeHtml(r.name)}</td>
+                <td class="text-slate-500">${escapeHtml(r.type)}</td>
+                <td class="text-slate-500">${escapeHtml(r.notes)}</td>
+                <td>${r.active ? '<span class="badge bg-emerald-100 text-emerald-700">yes</span>' : '<span class="badge bg-slate-100 text-slate-500">no</span>'}</td>
+                <td class="text-right">
+                  ${can('manager') ? `<button class="btn btn-ghost text-xs" data-edit='${escapeHtml(JSON.stringify(r))}'>Edit</button>` : ''}
+                  ${can('manager') ? `<button class="btn btn-ghost text-xs text-rose-600" data-del="${r.id}">Del</button>` : ''}
+                </td>
+              </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>`;
+  if (can('manager')) document.getElementById('new-loc').onclick = () => openLocationModal();
+  root.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => openLocationModal(JSON.parse(b.dataset.edit)));
+  root.querySelectorAll('[data-del]').forEach(b => b.onclick = () => deleteLocation(b.dataset.del));
+}
+
+async function openLocationModal(existing) {
+  const e = existing || {};
+  const html = `
+    ${fieldset('Name *', `<input class="input" name="name" value="${escapeHtml(e.name || '')}" required />`)}
+    ${fieldset('Type', `<select class="input" name="type">
+      ${['storage','prep','service','other'].map(t => `<option value="${t}" ${e.type === t ? 'selected' : ''}>${t}</option>`).join('')}
+    </select>`)}
+    ${fieldset('Notes', `<textarea class="input" rows="2" name="notes">${escapeHtml(e.notes || '')}</textarea>`)}
+    <label class="inline-flex items-center gap-2 text-sm"><input type="checkbox" name="active" ${e.id === undefined || e.active ? 'checked' : ''} /> Active</label>
+    <div class="flex justify-end gap-2 mt-4">
+      <button class="btn btn-secondary" data-cancel>Cancel</button>
+      <button class="btn btn-primary" data-save>Save</button>
+    </div>`;
+  await modal(html, {
+    title: existing ? 'Edit location' : 'New location',
+    onMount: (m, close) => {
+      m.querySelector('[data-cancel]').onclick = () => close(null);
+      m.querySelector('[data-save]').onclick = async () => {
+        const get = (n) => m.querySelector(`[name="${n}"]`).value;
+        try {
+          await api('locations.upsert', {
+            id: existing ? existing.id : undefined,
+            name: get('name'), type: get('type'), notes: get('notes'),
+            active: m.querySelector('[name="active"]').checked
+          });
+          toast('Saved', 'success');
+          close(true);
+          bootRefresh();
+        } catch (e) { toast(e.message, 'error'); }
+      };
+    }
+  });
+}
+
+async function deleteLocation(id) {
+  if (!(await confirmDialog('Delete this location? Blocked if any stock still sits here.'))) return;
+  try { await api('locations.delete', { id }); toast('Deleted', 'success'); bootRefresh(); }
+  catch (e) { toast(e.message, 'error'); }
+}
+
+// ---------- Import ----------
+
+function viewImport(root) {
+  const masterSample = 'ITEM,PACK,PACK COST,BASE UNIT,UNIT QTY,COST PER G/ML/PC,BRAND,SUPPLIER,TYPE,NOTES\nALL PURPOSE FLOUR JOP,1 KG,57.00,G,1000,₱0.06,,JOPHIL,RAW ING,\nBACARDI BLACK RUM,1 BTL,"1,000.00",ML,750,₱1.33,Bacardi,BARNA,RAW ING,';
+  root.innerHTML = `
+    <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-4">
+      <h3 class="font-semibold mb-2">Bulk import from FF Master List</h3>
+      <p class="text-sm text-slate-600 mb-2">
+        Paste your master list CSV below (with a header row). The importer recognizes your existing columns:
+        <code class="text-xs">ITEM, PACK, PACK COST, BASE UNIT, UNIT QTY, COST PER G/ML/PC, BRAND, SUPPLIER, TYPE, NOTES</code>.
+      </p>
+      <ul class="text-xs text-slate-600 mb-2 list-disc pl-5 space-y-1">
+        <li>Items are uniquely identified by <b>ITEM + SUPPLIER</b>, so per-supplier rows stay separate</li>
+        <li>Suppliers not yet in the system are <b>auto-created</b></li>
+        <li>Identical duplicate rows are skipped (with a notice)</li>
+        <li>₱ symbols and comma thousands separators are stripped automatically</li>
+        <li>No opening stock is posted — this file is a catalog. Use stock counts later to set opening balances.</li>
+      </ul>
+      <details class="text-xs text-slate-500 mb-3"><summary class="cursor-pointer">Show sample (your format)</summary><pre class="bg-slate-50 p-3 rounded overflow-x-auto mt-2">${escapeHtml(masterSample)}</pre></details>
+      <textarea id="csv-text" class="input font-mono text-xs" rows="10" placeholder="Paste your master list CSV here…"></textarea>
+      <div class="flex gap-2 mt-3 justify-end">
+        <button class="btn btn-secondary" id="csv-preview">Preview (dry run)</button>
+        <button class="btn btn-primary" id="csv-import" disabled>Import</button>
+      </div>
+    </div>
+    <div id="csv-report"></div>`;
+  let parsed = null;
+  document.getElementById('csv-preview').onclick = async () => {
+    const text = document.getElementById('csv-text').value.trim();
+    if (!text) { toast('Paste a CSV first', 'error'); return; }
+    try {
+      parsed = parseCsv(text);
+      if (!parsed.rows.length) throw new Error('No data rows found.');
+      // Dry-run on server
+      const report = await api('import.items', { rows: parsed.rows, dry_run: true });
+      renderCsvReport(parsed, report, true);
+      document.getElementById('csv-import').disabled = false;
+    } catch (e) { toast(e.message, 'error'); }
+  };
+  document.getElementById('csv-import').onclick = async () => {
+    if (!parsed) return;
+    if (!(await confirmDialog(`Import ${parsed.rows.length} rows? This will create/update items and post opening-stock transactions.`))) return;
+    try {
+      const report = await api('import.items', { rows: parsed.rows, dry_run: false });
+      renderCsvReport(parsed, report, false);
+      toast(`Imported: ${report.created} new, ${report.updated} updated, ${report.suppliers_created || 0} suppliers auto-created`, 'success');
+      bootRefresh();
+    } catch (e) { toast(e.message, 'error'); }
+  };
+}
+
+function renderCsvReport(parsed, report, isDryRun) {
+  const el = document.getElementById('csv-report');
+  const verb = isDryRun ? 'Will' : 'Did';
+  el.innerHTML = `
+    <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
+      <h3 class="font-semibold mb-3">${isDryRun ? 'Preview' : 'Result'} — ${parsed.rows.length} rows</h3>
+      <div class="grid grid-cols-2 sm:grid-cols-5 gap-3 mb-4">
+        <div class="border border-slate-200 rounded p-3"><div class="text-xs text-slate-500">${verb} create items</div><div class="font-bold">${report.created}</div></div>
+        <div class="border border-slate-200 rounded p-3"><div class="text-xs text-slate-500">${verb} update items</div><div class="font-bold">${report.updated}</div></div>
+        <div class="border border-slate-200 rounded p-3"><div class="text-xs text-slate-500">${verb} auto-create suppliers</div><div class="font-bold">${report.suppliers_created || 0}</div></div>
+        <div class="border border-slate-200 rounded p-3"><div class="text-xs text-slate-500">Opening stock txns</div><div class="font-bold">${report.opening_posted || 0}</div></div>
+        <div class="border border-slate-200 rounded p-3 ${report.errors.length ? 'border-rose-300 bg-rose-50' : ''}"><div class="text-xs text-slate-500">Errors / notices</div><div class="font-bold ${report.errors.length ? 'text-rose-600' : ''}">${report.errors.length}</div></div>
+      </div>
+      ${report.errors.length ? `
+        <h4 class="font-medium text-sm mb-2 text-rose-600">Row issues</h4>
+        <div class="max-h-64 overflow-y-auto border border-slate-200 rounded mb-4">
+          <table>
+            <thead class="sticky top-0"><tr><th>CSV row</th><th>Name</th><th>Issue</th></tr></thead>
+            <tbody>
+              ${report.errors.map(e => `<tr>
+                <td>${e.row}</td><td class="text-slate-500">${escapeHtml(e.name || e.sku || '')}</td><td class="text-rose-700">${escapeHtml(e.message)}</td>
+              </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>` : '<p class="text-sm text-emerald-700">No issues.</p>'}
+    </div>`;
+}
+
+/**
+ * Minimal CSV parser that handles quoted fields and embedded commas/newlines.
+ * Returns { headers: [...], rows: [{header: value}, ...] }
+ */
+function parseCsv(text) {
+  // RFC-4180-ish: support double-quote escaping ("" → ")
+  const rows = [];
+  let cur = [];
+  let field = '';
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; }
+        else inQuotes = false;
+      } else field += ch;
+    } else {
+      if (ch === '"') inQuotes = true;
+      else if (ch === ',') { cur.push(field); field = ''; }
+      else if (ch === '\n' || ch === '\r') {
+        if (ch === '\r' && text[i + 1] === '\n') i++;
+        cur.push(field); rows.push(cur); cur = []; field = '';
+      } else field += ch;
+    }
+  }
+  if (field !== '' || cur.length) { cur.push(field); rows.push(cur); }
+  if (!rows.length) return { headers: [], rows: [] };
+  const headers = rows.shift().map(h => h.trim());
+  const objects = rows
+    .filter(r => r.some(c => String(c).trim() !== ''))  // skip blank lines
+    .map(r => {
+      const o = {};
+      headers.forEach((h, i) => { o[h] = (r[i] !== undefined ? r[i] : '').trim(); });
+      return o;
+    });
+  return { headers, rows: objects };
 }
 
 // ---------- Boot ----------
