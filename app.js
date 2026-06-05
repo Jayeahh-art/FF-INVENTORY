@@ -92,20 +92,38 @@ function toast(msg, kind = 'info') {
 function modal(html, opts = {}) {
   return new Promise((resolve) => {
     const root = document.getElementById('modal-root');
+    const widthClass = opts.wide ? 'modal modal-lg' : 'modal';
     root.innerHTML = `
       <div class="modal-backdrop">
-        <div class="modal">
-          <div class="px-6 py-4 border-b border-slate-200 flex items-center justify-between">
+        <div class="${widthClass}">
+          <div class="px-6 py-4 border-b border-slate-200 flex items-center justify-between sticky top-0 bg-white z-10 rounded-t-xl">
             <h3 class="font-semibold">${opts.title || ''}</h3>
             <button class="btn btn-ghost text-xl leading-none" data-close>×</button>
           </div>
           <div class="p-6">${html}</div>
         </div>
       </div>`;
-    const close = (result) => { root.innerHTML = ''; resolve(result); };
+    const close = (result) => {
+      root.innerHTML = '';
+      document.removeEventListener('keydown', onKey);
+      resolve(result);
+    };
+    // Esc closes, Ctrl/Cmd+Enter saves (if a [data-save] button exists in the modal).
+    const onKey = (e) => {
+      if (e.key === 'Escape') { e.preventDefault(); close(null); }
+      else if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+        const save = root.querySelector('.modal [data-save]');
+        if (save) { e.preventDefault(); save.click(); }
+      }
+    };
+    document.addEventListener('keydown', onKey);
     root.querySelector('[data-close]').onclick = () => close(null);
     root.querySelector('.modal-backdrop').onclick = (e) => { if (e.target === e.currentTarget) close(null); };
-    opts.onMount && opts.onMount(root.querySelector('.modal'), close);
+    const modalEl = root.querySelector('.modal');
+    opts.onMount && opts.onMount(modalEl, close);
+    // Auto-focus the first focusable input that isn't readonly/disabled.
+    const focusTarget = modalEl.querySelector('input:not([readonly]):not([disabled]), textarea:not([readonly]):not([disabled]), select:not([disabled])');
+    if (focusTarget) setTimeout(() => focusTarget.focus(), 50);
   });
 }
 
@@ -308,6 +326,70 @@ function fieldset(label, html) {
   return `<label class="block mb-3"><span class="text-xs font-medium text-slate-600 uppercase tracking-wide">${label}</span><div class="mt-1">${html}</div></label>`;
 }
 
+// ---------- pagination + sort helpers ----------
+
+/**
+ * Apply filter, sort, and pagination to a row list. Pure function — caller manages state.
+ * Returns { visible, total, totalPages, page, pageSize }.
+ */
+function paginateRows({ rows, filter, sortBy, sortDir = 'asc', page = 1, pageSize = 50 }) {
+  let r = filter ? rows.filter(filter) : rows.slice();
+  if (sortBy) {
+    r.sort((a, b) => {
+      const av = a[sortBy], bv = b[sortBy];
+      const cmp = (typeof av === 'number' && typeof bv === 'number')
+        ? av - bv
+        : String(av == null ? '' : av).localeCompare(String(bv == null ? '' : bv));
+      return sortDir === 'desc' ? -cmp : cmp;
+    });
+  }
+  const total = r.length;
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const safePage = Math.min(Math.max(1, page), totalPages);
+  const start = (safePage - 1) * pageSize;
+  return { visible: r.slice(start, start + pageSize), total, totalPages, page: safePage, pageSize };
+}
+
+/** Renders pagination controls into a container element. */
+function renderPaginator(rootEl, p, onChange) {
+  const lo = p.total === 0 ? 0 : (p.page - 1) * p.pageSize + 1;
+  const hi = Math.min(p.page * p.pageSize, p.total);
+  rootEl.innerHTML = `
+    <div class="flex items-center justify-between mt-3 text-sm flex-wrap gap-2 px-3 py-2 bg-slate-50 border-t border-slate-200 rounded-b-xl">
+      <div class="text-slate-500">${p.total === 0 ? 'No rows' : `Showing <b>${lo}–${hi}</b> of <b>${p.total}</b>`}</div>
+      <div class="flex items-center gap-2">
+        <label class="text-slate-500 text-xs">Per page:</label>
+        <select data-page-size class="input w-auto text-xs">
+          ${[25, 50, 100, 250, 999999].map(n => `<option value="${n}" ${p.pageSize === n ? 'selected' : ''}>${n === 999999 ? 'All' : n}</option>`).join('')}
+        </select>
+        <button data-prev class="btn btn-secondary text-xs" ${p.page <= 1 ? 'disabled' : ''}>‹ Prev</button>
+        <span class="text-slate-600 whitespace-nowrap text-xs">Page <b>${p.page}</b> / ${p.totalPages}</span>
+        <button data-next class="btn btn-secondary text-xs" ${p.page >= p.totalPages ? 'disabled' : ''}>Next ›</button>
+      </div>
+    </div>`;
+  rootEl.querySelector('[data-page-size]').onchange = (e) => onChange({ pageSize: Number(e.target.value), page: 1 });
+  rootEl.querySelector('[data-prev]').onclick = () => onChange({ page: p.page - 1 });
+  rootEl.querySelector('[data-next]').onclick = () => onChange({ page: p.page + 1 });
+}
+
+/** A sortable <th>. Click toggles between asc/desc. */
+function sortableTh(label, key, sortBy, sortDir, extraClass = '') {
+  const active = sortBy === key;
+  const arrow = active ? `<span class="text-brand-600">${sortDir === 'asc' ? '▲' : '▼'}</span>` : '<span class="text-slate-300">▲</span>';
+  return `<th data-sort="${key}" class="cursor-pointer hover:bg-slate-100 select-none ${extraClass}"><span class="inline-flex items-center gap-1">${label} <span class="text-[10px]">${arrow}</span></span></th>`;
+}
+
+/** Wire sortable headers within a table container; calls onChange with {sortBy, sortDir}. */
+function bindSortable(tableEl, currentSortBy, currentSortDir, onChange) {
+  tableEl.querySelectorAll('th[data-sort]').forEach(th => {
+    th.onclick = () => {
+      const key = th.dataset.sort;
+      const nextDir = (currentSortBy === key && currentSortDir === 'asc') ? 'desc' : 'asc';
+      onChange({ sortBy: key, sortDir: nextDir, page: 1 });
+    };
+  });
+}
+
 // ============================================================
 // VIEWS
 // ============================================================
@@ -379,6 +461,10 @@ function viewInventory(root) {
   // Per-location totals for the chip strip
   const locTotals = {};
   byLoc.forEach(r => { locTotals[r.location_id] = (locTotals[r.location_id] || 0) + (r.value || 0); });
+
+  state.viewInv = state.viewInv || { filter: '', locationId: '', page: 1, pageSize: 50, sortBy: 'name', sortDir: 'asc' };
+  const vs = state.viewInv;
+
   root.innerHTML = `
     <div class="bg-white rounded-xl shadow-sm border border-slate-200 mb-4 p-4">
       <div class="flex items-center justify-between mb-2">
@@ -397,45 +483,61 @@ function viewInventory(root) {
       </div>
     </div>
     <div class="bg-white rounded-xl shadow-sm border border-slate-200">
-      <div class="px-5 py-3 border-b border-slate-200 flex items-center justify-between gap-3">
+      <div class="px-5 py-3 border-b border-slate-200 flex items-center justify-between gap-3 flex-wrap">
         <h3 class="font-semibold">On-hand inventory</h3>
-        <select id="inv-loc-filter" class="input max-w-xs">
-          <option value="">All locations (totals)</option>
-          ${locs.filter(l => l.active).map(l => `<option value="${l.id}">${escapeHtml(l.name)}</option>`).join('')}
-        </select>
+        <div class="flex gap-2 flex-wrap items-center">
+          <input id="inv-q" class="input max-w-xs" placeholder="Search…" value="${escapeHtml(vs.filter)}" />
+          <select id="inv-loc-filter" class="input max-w-xs">
+            <option value="">All locations (totals)</option>
+            ${locs.filter(l => l.active).map(l => `<option value="${l.id}" ${vs.locationId === l.id ? 'selected' : ''}>${escapeHtml(l.name)}</option>`).join('')}
+          </select>
+        </div>
       </div>
-      <table>
+      <table id="inv-table">
         <thead><tr>
-          <th>SKU</th><th>Name</th><th>Unit</th>
-          <th class="text-right">On hand</th><th class="text-right">Avg cost</th><th class="text-right">Value</th>
+          ${sortableTh('SKU', 'sku', vs.sortBy, vs.sortDir)}
+          ${sortableTh('Name', 'name', vs.sortBy, vs.sortDir)}
+          ${sortableTh('Unit', 'unit', vs.sortBy, vs.sortDir)}
+          ${sortableTh('On hand', 'on_hand', vs.sortBy, vs.sortDir, 'text-right')}
+          ${sortableTh('Avg cost', 'avg_cost', vs.sortBy, vs.sortDir, 'text-right')}
+          ${sortableTh('Value', 'value', vs.sortBy, vs.sortDir, 'text-right')}
           <th></th>
         </tr></thead>
         <tbody id="inv-tbody"></tbody>
       </table>
+      <div id="inv-pager"></div>
     </div>
   `;
   const itemById = {};
   rows.forEach(r => { itemById[r.item_id] = r; });
+
   const render = () => {
-    const locId = document.getElementById('inv-loc-filter').value;
-    let displayRows;
-    if (!locId) {
-      displayRows = rows;
+    // Build the row set
+    let base;
+    if (!vs.locationId) {
+      base = rows;
     } else {
-      // Filter to per-location qty/value for the chosen location.
-      displayRows = byLoc.filter(b => b.location_id === locId).map(b => {
+      base = byLoc.filter(b => b.location_id === vs.locationId).map(b => {
         const meta = itemById[b.item_id] || { sku: '', name: '(unknown)', unit: '' };
         return {
           item_id: b.item_id, sku: meta.sku, name: meta.name, unit: meta.unit,
           on_hand: b.qty, avg_cost: b.avg_cost, value: b.value
         };
-      }).sort((a, b) => a.name.localeCompare(b.name));
+      });
     }
-    document.getElementById('inv-tbody').innerHTML = displayRows.length === 0
+    const q = vs.filter.toLowerCase();
+    const p = paginateRows({
+      rows: base,
+      filter: q ? r => (r.name + ' ' + r.sku).toLowerCase().includes(q) : null,
+      sortBy: vs.sortBy, sortDir: vs.sortDir,
+      page: vs.page, pageSize: vs.pageSize
+    });
+    vs.page = p.page;
+    document.getElementById('inv-tbody').innerHTML = p.visible.length === 0
       ? '<tr><td colspan="7" class="text-center text-slate-400 py-6">No items</td></tr>'
-      : displayRows.map(r => `
+      : p.visible.map(r => `
         <tr>
-          <td class="text-slate-500">${escapeHtml(r.sku)}</td>
+          <td class="text-slate-500 font-mono text-xs">${escapeHtml(r.sku)}</td>
           <td class="font-medium">${escapeHtml(r.name)}</td>
           <td class="text-slate-500">${escapeHtml(r.unit)}</td>
           <td class="text-right ${r.on_hand < 0 ? 'text-rose-600' : ''}">${fmtNum(r.on_hand)}</td>
@@ -448,8 +550,11 @@ function viewInventory(root) {
     document.querySelectorAll('[data-adj]').forEach(btn => {
       btn.onclick = () => openAdjustModal(btn.dataset.adj);
     });
+    renderPaginator(document.getElementById('inv-pager'), p, (delta) => { Object.assign(vs, delta); render(); });
+    bindSortable(document.getElementById('inv-table'), vs.sortBy, vs.sortDir, (delta) => { Object.assign(vs, delta); render(); });
   };
-  document.getElementById('inv-loc-filter').onchange = render;
+  document.getElementById('inv-q').oninput = (e) => { vs.filter = e.target.value; vs.page = 1; render(); };
+  document.getElementById('inv-loc-filter').onchange = (e) => { vs.locationId = e.target.value; vs.page = 1; render(); };
   render();
 }
 
@@ -534,36 +639,52 @@ function viewLowStock(root) {
 
 function viewItems(root) {
   const rows = state.boot.items;
+  // Persist view state across re-renders within this session (filter survives bootRefresh).
+  state.viewItems = state.viewItems || { filter: '', page: 1, pageSize: 50, sortBy: 'name', sortDir: 'asc' };
+  const vs = state.viewItems;
+
   root.innerHTML = `
-    <div class="flex justify-between items-center mb-4 gap-2">
-      <input id="items-q" class="input max-w-sm" placeholder="Search by name, SKU, brand, supplier, category…" />
+    <div class="flex justify-between items-center mb-4 gap-2 flex-wrap">
+      <input id="items-q" class="input max-w-sm" placeholder="Search by name, SKU, brand, supplier, category…" value="${escapeHtml(vs.filter)}" />
       <div class="flex gap-2">
         ${can('admin') ? '<button class="btn btn-ghost text-rose-600 text-xs" id="wipe-items" title="Delete all items (only if no transactions yet)">Wipe all</button>' : ''}
         ${can('manager') ? '<button class="btn btn-primary" id="new-item">+ New item</button>' : ''}
       </div>
     </div>
     <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-auto">
-      <table>
+      <table id="items-table">
         <thead><tr>
-          <th>SKU</th><th>Name</th><th>Brand</th><th>Category</th><th>Unit</th>
-          <th class="text-right">Suppliers</th>
-          <th class="text-right">Best ₱/unit</th>
-          <th class="text-right">Preferred ₱/unit</th>
-          <th class="text-right">On hand</th>
-          <th class="text-right">WAC</th>
+          ${sortableTh('SKU', 'sku', vs.sortBy, vs.sortDir)}
+          ${sortableTh('Name', 'name', vs.sortBy, vs.sortDir)}
+          ${sortableTh('Brand', 'brand', vs.sortBy, vs.sortDir)}
+          ${sortableTh('Category', 'category', vs.sortBy, vs.sortDir)}
+          ${sortableTh('Unit', 'unit', vs.sortBy, vs.sortDir)}
+          ${sortableTh('Suppliers', 'supplier_count', vs.sortBy, vs.sortDir, 'text-right')}
+          ${sortableTh('Best ₱/unit', 'best_unit_cost', vs.sortBy, vs.sortDir, 'text-right')}
+          ${sortableTh('Preferred ₱/unit', 'preferred_unit_cost', vs.sortBy, vs.sortDir, 'text-right')}
+          ${sortableTh('On hand', 'on_hand', vs.sortBy, vs.sortDir, 'text-right')}
+          ${sortableTh('WAC', 'avg_cost', vs.sortBy, vs.sortDir, 'text-right')}
           <th></th>
         </tr></thead>
         <tbody id="items-tbody"></tbody>
       </table>
+      <div id="items-pager"></div>
     </div>`;
-  const render = (filter) => {
-    const q = (filter || '').toLowerCase();
-    const filtered = rows.filter(r =>
-      !q || (r.name + ' ' + r.sku + ' ' + r.brand + ' ' + r.category + ' ' + r.default_supplier_name + ' ' + (r.supplier_prices || []).map(p => p.supplier_name).join(' ')).toLowerCase().includes(q)
-    );
-    document.getElementById('items-tbody').innerHTML = filtered.length === 0
+
+  const render = () => {
+    const q = vs.filter.toLowerCase();
+    const p = paginateRows({
+      rows,
+      filter: q
+        ? r => (r.name + ' ' + r.sku + ' ' + r.brand + ' ' + r.category + ' ' + r.default_supplier_name + ' ' + (r.supplier_prices || []).map(sp => sp.supplier_name).join(' ')).toLowerCase().includes(q)
+        : null,
+      sortBy: vs.sortBy, sortDir: vs.sortDir,
+      page: vs.page, pageSize: vs.pageSize
+    });
+    vs.page = p.page;
+    document.getElementById('items-tbody').innerHTML = p.visible.length === 0
       ? '<tr><td colspan="11" class="text-center text-slate-400 py-6">No items</td></tr>'
-      : filtered.map(r => `
+      : p.visible.map(r => `
         <tr>
           <td class="text-slate-500 font-mono text-xs">${escapeHtml(r.sku)}</td>
           <td class="font-medium">${escapeHtml(r.name)} ${!r.active ? '<span class="badge bg-slate-100 text-slate-500 ml-1">inactive</span>' : ''}</td>
@@ -582,15 +703,18 @@ function viewItems(root) {
         </tr>`).join('');
     document.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => openItemModal(b.dataset.edit));
     document.querySelectorAll('[data-del]').forEach(b => b.onclick = () => deleteItem(b.dataset.del));
+    renderPaginator(document.getElementById('items-pager'), p, (delta) => { Object.assign(vs, delta); render(); });
+    bindSortable(document.getElementById('items-table'), vs.sortBy, vs.sortDir, (delta) => { Object.assign(vs, delta); render(); });
   };
-  document.getElementById('items-q').oninput = (e) => render(e.target.value);
+
+  document.getElementById('items-q').oninput = (e) => { vs.filter = e.target.value; vs.page = 1; render(); };
   if (can('manager')) document.getElementById('new-item').onclick = () => openItemModal();
   if (can('admin')) document.getElementById('wipe-items').onclick = async () => {
     if (!(await confirmDialog('Wipe ALL items, supplier prices, and stock state? Refuses if any inventory transactions exist.'))) return;
     try { const r = await api('items.wipeAll', {}); toast(r, 'success'); bootRefresh(); }
     catch (e) { toast(e.message, 'error'); }
   };
-  render('');
+  render();
 }
 
 async function openItemModal(id) {
@@ -659,6 +783,7 @@ async function openItemModal(id) {
 
   await modal(html, {
     title: id ? 'Edit item' : 'New item',
+    wide: true,
     onMount: (m, close) => {
       const tbody = m.querySelector('#prices-tbody');
       const yieldInput = m.querySelector('[name="yield_pct"]');
@@ -956,6 +1081,7 @@ async function openPOEditor(id) {
 
   await modal(html, {
     title: existing ? 'Edit PO ' + existing.po_number : 'New purchase order',
+    wide: true,
     onMount: (m, close) => {
       const tbody = m.querySelector('#po-lines');
       let counter = lines.length;
@@ -1155,6 +1281,7 @@ async function openReceiveModal(poId) {
     </div>`;
   await modal(html, {
     title: 'Receive goods',
+    wide: true,
     onMount: (m, close) => {
       m.querySelector('[data-cancel]').onclick = () => close(null);
       m.querySelector('[data-post]').onclick = async () => {
@@ -1317,6 +1444,7 @@ async function openCountModal(id) {
     </div>`;
   await modal(html, {
     title: 'Stock count detail',
+    wide: true,
     onMount: (m, close) => {
       m.querySelector('[data-close]').onclick = () => close(null);
       if (editable) {
