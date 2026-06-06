@@ -23,6 +23,9 @@ const ROUTES = [
   { hash: 'ledger',     title: 'Ledger',           icon: '≡', view: viewLedger,     min: 'viewer' },
   { hash: 'counts',     title: 'Stock Counts',     icon: '☑', view: viewCounts,     min: 'viewer' },
   { hash: 'import',     title: 'Import',           icon: '⇪', view: viewImport,     min: 'manager' },
+  { hash: 'reports',    title: 'Reports',          icon: '◫', view: viewReports,    min: 'manager' },
+  { hash: 'audit',      title: 'Audit Log',        icon: '⚖', view: viewAudit,      min: 'admin'  },
+  { hash: 'diagnostics',title: 'Diagnostics',      icon: '⚙', view: viewDiagnostics, min: 'admin' },
   { hash: 'users',      title: 'Users',            icon: '☻', view: viewUsers,      min: 'admin'  }
 ];
 
@@ -121,8 +124,27 @@ function modal(html, opts = {}) {
     root.querySelector('.modal-backdrop').onclick = (e) => { if (e.target === e.currentTarget) close(null); };
     const modalEl = root.querySelector('.modal');
     opts.onMount && opts.onMount(modalEl, close);
-    // Auto-focus the first focusable input that isn't readonly/disabled.
-    const focusTarget = modalEl.querySelector('input:not([readonly]):not([disabled]), textarea:not([readonly]):not([disabled]), select:not([disabled])');
+    // Save button: wrap its onclick to debounce concurrent clicks + show "Saving…" feedback.
+    // Modules just set [data-save].onclick = async fn — this guard catches double-firing.
+    const saveBtn = modalEl.querySelector('[data-save]');
+    if (saveBtn) {
+      const originalHandler = saveBtn.onclick;
+      saveBtn.onclick = async (ev) => {
+        if (saveBtn.disabled) return;
+        saveBtn.disabled = true;
+        const originalText = saveBtn.textContent;
+        saveBtn.textContent = 'Saving…';
+        saveBtn.style.opacity = '0.7';
+        try { await (originalHandler && originalHandler.call(saveBtn, ev)); }
+        finally {
+          saveBtn.disabled = false;
+          saveBtn.textContent = originalText;
+          saveBtn.style.opacity = '1';
+        }
+      };
+    }
+    // Auto-focus the first focusable input (skip checkboxes — usually not the primary entry).
+    const focusTarget = modalEl.querySelector('input[type="text"]:not([readonly]):not([disabled]), input[type="email"]:not([readonly]):not([disabled]), input[type="number"]:not([readonly]):not([disabled]), input:not([type]):not([readonly]):not([disabled]), textarea:not([readonly]):not([disabled]), select:not([disabled])');
     if (focusTarget) setTimeout(() => focusTarget.focus(), 50);
   });
 }
@@ -701,8 +723,8 @@ function viewItems(root) {
             ${can('manager') ? `<button class="btn btn-ghost text-xs text-rose-600" data-del="${r.id}">Del</button>` : ''}
           </td>
         </tr>`).join('');
-    document.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => openItemModal(b.dataset.edit));
-    document.querySelectorAll('[data-del]').forEach(b => b.onclick = () => deleteItem(b.dataset.del));
+    root.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => openItemModal(b.dataset.edit));
+    root.querySelectorAll('[data-del]').forEach(b => b.onclick = () => deleteItem(b.dataset.del));
     renderPaginator(document.getElementById('items-pager'), p, (delta) => { Object.assign(vs, delta); render(); });
     bindSortable(document.getElementById('items-table'), vs.sortBy, vs.sortDir, (delta) => { Object.assign(vs, delta); render(); });
   };
@@ -897,8 +919,8 @@ function viewSuppliers(root) {
             ${can('manager') ? `<button class="btn btn-ghost text-xs text-rose-600" data-del="${r.id}">Del</button>` : ''}
           </td>
         </tr>`).join('');
-    document.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => openSupplierModal(b.dataset.edit));
-    document.querySelectorAll('[data-del]').forEach(b => b.onclick = () => deleteSupplier(b.dataset.del));
+    root.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => openSupplierModal(b.dataset.edit));
+    root.querySelectorAll('[data-del]').forEach(b => b.onclick = () => deleteSupplier(b.dataset.del));
   };
   document.getElementById('sup-q').oninput = (e) => render(e.target.value);
   if (can('manager')) document.getElementById('new-sup').onclick = () => openSupplierModal();
@@ -1745,6 +1767,217 @@ function parseCsv(text) {
       return o;
     });
   return { headers, rows: objects };
+}
+
+// ---------- Reports (CSV exports for accounting) ----------
+
+function viewReports(root) {
+  const today = new Date().toISOString().slice(0, 10);
+  const monthAgo = new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString().slice(0, 10);
+  root.innerHTML = `
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+      <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
+        <h3 class="font-semibold mb-1">Inventory ledger CSV</h3>
+        <p class="text-xs text-slate-500 mb-3">Every transaction with item, location, supplier, and suggested debit/credit accounts. Use this to import into your accounting system or for audit.</p>
+        ${fieldset('From', `<input class="input" type="date" id="ledger-from" value="${monthAgo}" />`)}
+        ${fieldset('To', `<input class="input" type="date" id="ledger-to" value="${today}" />`)}
+        <button class="btn btn-primary w-full justify-center" id="dl-ledger">Download CSV</button>
+      </div>
+      <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
+        <h3 class="font-semibold mb-1">Inventory valuation snapshot</h3>
+        <p class="text-xs text-slate-500 mb-3">Point-in-time on-hand × WAC per item. Independent of cached state — recomputed from transactions. This is your period-end inventory value.</p>
+        ${fieldset('As of', `<input class="input" type="date" id="val-asof" value="${today}" />`)}
+        <button class="btn btn-primary w-full justify-center" id="dl-val">Download CSV</button>
+      </div>
+      <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
+        <h3 class="font-semibold mb-1">Daily journal summary</h3>
+        <p class="text-xs text-slate-500 mb-3">Transactions rolled up by date and account, ready to paste into a GL. One row = one journal entry (debit × credit × amount).</p>
+        ${fieldset('From', `<input class="input" type="date" id="jrn-from" value="${monthAgo}" />`)}
+        ${fieldset('To', `<input class="input" type="date" id="jrn-to" value="${today}" />`)}
+        <button class="btn btn-primary w-full justify-center" id="dl-jrn">Download CSV</button>
+      </div>
+    </div>
+  `;
+  const dl = (filename, content) => {
+    const blob = new Blob([content], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+  document.getElementById('dl-ledger').onclick = async () => {
+    try {
+      const r = await api('export.ledger', {
+        from_date: document.getElementById('ledger-from').value,
+        to_date: document.getElementById('ledger-to').value
+      });
+      dl(r.filename, r.csv);
+      toast(`Exported ${r.row_count} transactions`, 'success');
+    } catch (e) { toast(e.message, 'error'); }
+  };
+  document.getElementById('dl-val').onclick = async () => {
+    try {
+      const r = await api('export.valuation', { as_of: document.getElementById('val-asof').value });
+      dl(r.filename, r.csv);
+      toast(`Total valuation: ${fmtMoney(r.grand_total)}`, 'success');
+    } catch (e) { toast(e.message, 'error'); }
+  };
+  document.getElementById('dl-jrn').onclick = async () => {
+    try {
+      const r = await api('export.journal', {
+        from_date: document.getElementById('jrn-from').value,
+        to_date: document.getElementById('jrn-to').value
+      });
+      dl(r.filename, r.csv);
+      toast(`Exported ${r.entry_count} journal entries`, 'success');
+    } catch (e) { toast(e.message, 'error'); }
+  };
+}
+
+// ---------- Audit Log ----------
+
+async function viewAudit(root) {
+  root.innerHTML = `
+    <div class="flex justify-between items-center mb-4 gap-2 flex-wrap">
+      <div class="flex gap-2">
+        <input id="audit-entity" class="input" placeholder="Entity (Items, PurchaseOrders…)" />
+        <input id="audit-user" class="input" placeholder="User email" />
+        <button class="btn btn-primary text-xs" id="audit-go">Search</button>
+      </div>
+    </div>
+    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-auto">
+      <table>
+        <thead><tr>
+          <th>When</th><th>User</th><th>Action</th><th>Entity</th><th>Entity ID</th><th>Before → After</th>
+        </tr></thead>
+        <tbody id="audit-tbody"><tr><td colspan="6" class="text-center text-slate-400 py-6">Loading…</td></tr></tbody>
+      </table>
+    </div>`;
+  const load = async () => {
+    try {
+      const rows = await api('audit.list', {
+        entity: document.getElementById('audit-entity').value || undefined,
+        user_email: document.getElementById('audit-user').value || undefined,
+        limit: 500
+      });
+      document.getElementById('audit-tbody').innerHTML = rows.length === 0
+        ? '<tr><td colspan="6" class="text-center text-slate-400 py-6">No entries</td></tr>'
+        : rows.map(r => `
+          <tr>
+            <td class="text-slate-500 whitespace-nowrap text-xs">${fmtDate(r.timestamp)}</td>
+            <td class="text-slate-500 text-xs">${escapeHtml(r.user_email)}</td>
+            <td><span class="badge bg-slate-100 text-slate-700">${escapeHtml(r.action)}</span></td>
+            <td class="text-slate-500">${escapeHtml(r.entity)}</td>
+            <td class="text-slate-400 font-mono text-xs">${escapeHtml(r.entity_id ? r.entity_id.slice(0, 8) : '')}</td>
+            <td class="text-xs">
+              ${r.before ? `<details><summary class="cursor-pointer text-rose-600">before</summary><pre class="bg-rose-50 p-2 rounded text-[10px] overflow-x-auto">${escapeHtml(r.before)}</pre></details>` : ''}
+              ${r.after ? `<details><summary class="cursor-pointer text-emerald-700">after</summary><pre class="bg-emerald-50 p-2 rounded text-[10px] overflow-x-auto">${escapeHtml(r.after)}</pre></details>` : ''}
+            </td>
+          </tr>`).join('');
+    } catch (e) { toast(e.message, 'error'); }
+  };
+  document.getElementById('audit-go').onclick = load;
+  load();
+}
+
+// ---------- Diagnostics ----------
+
+async function viewDiagnostics(root) {
+  root.innerHTML = `<div class="flex items-center gap-2 text-slate-500"><div class="spinner"></div> Running diagnostics…</div>`;
+  let d;
+  try { d = await api('app.diagnose'); }
+  catch (e) { root.innerHTML = `<div class="bg-rose-50 text-rose-700 border border-rose-200 rounded p-4">${escapeHtml(e.message)}</div>`; return; }
+
+  const orphanSum = Object.values(d.orphan_refs).reduce((s, n) => s + n, 0);
+  const issueCount = orphanSum + d.cost_state_drift.length + d.po_status_problems.length;
+
+  root.innerHTML = `
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-4">
+      <div class="bg-white rounded-xl shadow-sm border-l-4 ${issueCount === 0 ? 'border-emerald-500' : 'border-amber-500'} border-t border-r border-b border-slate-200 p-5">
+        <div class="text-xs uppercase tracking-wide text-slate-500 font-semibold">Overall</div>
+        <div class="text-2xl font-bold mt-1">${issueCount === 0 ? '✓ Healthy' : issueCount + ' issue(s)'}</div>
+        <div class="text-xs text-slate-500 mt-1">Server time: ${fmtDate(d.server_time)}</div>
+      </div>
+      <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
+        <div class="text-xs uppercase tracking-wide text-slate-500 font-semibold">Cost-state drift</div>
+        <div class="text-2xl font-bold mt-1 ${d.cost_state_drift.length === 0 ? 'text-emerald-700' : 'text-rose-600'}">${d.cost_state_drift.length}</div>
+        <div class="text-xs text-slate-500 mt-1">items where cached state ≠ ledger replay</div>
+      </div>
+      <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
+        <div class="text-xs uppercase tracking-wide text-slate-500 font-semibold">Orphan refs</div>
+        <div class="text-2xl font-bold mt-1 ${orphanSum === 0 ? 'text-emerald-700' : 'text-rose-600'}">${orphanSum}</div>
+        <div class="text-xs text-slate-500 mt-1">rows pointing at deleted parents</div>
+      </div>
+    </div>
+
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
+      <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
+        <h3 class="font-semibold mb-3">Table row counts</h3>
+        <table>
+          <tbody>
+            ${Object.entries(d.table_counts).map(([k, v]) => `
+              <tr>
+                <td class="font-medium">${escapeHtml(k)}</td>
+                <td class="text-right ${typeof v === 'string' ? 'text-rose-600' : 'text-slate-600'}">${v}</td>
+              </tr>`).join('')}
+          </tbody>
+        </table>
+      </div>
+      <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
+        <h3 class="font-semibold mb-3">Orphan reference breakdown</h3>
+        <table>
+          <tbody>
+            ${Object.entries(d.orphan_refs).map(([k, v]) => `
+              <tr>
+                <td class="text-slate-600">${escapeHtml(k.replace(/_/g, ' '))}</td>
+                <td class="text-right ${v > 0 ? 'text-rose-600 font-medium' : 'text-slate-500'}">${v}</td>
+              </tr>`).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    ${d.cost_state_drift.length > 0 ? `
+      <div class="bg-white rounded-xl shadow-sm border border-rose-300 mb-4">
+        <div class="p-4 border-b border-slate-200 flex justify-between items-center">
+          <div>
+            <h3 class="font-semibold text-rose-700">Cost-state drift</h3>
+            <p class="text-xs text-slate-600">Cached ItemCostState disagrees with re-played transaction history. Run <code>rebuildCostState()</code> from the Apps Script editor to fix.</p>
+          </div>
+        </div>
+        <table>
+          <thead><tr><th>Item</th><th class="text-right">Cached qty</th><th class="text-right">Replay qty</th><th class="text-right">Cached value</th><th class="text-right">Replay value</th></tr></thead>
+          <tbody>
+            ${d.cost_state_drift.map(r => `
+              <tr>
+                <td class="text-xs font-mono">${escapeHtml(r.item_id.slice(0, 8))}</td>
+                <td class="text-right">${fmtNum(r.cached_qty)}</td>
+                <td class="text-right">${fmtNum(r.replay_qty)}</td>
+                <td class="text-right">${fmtMoney(r.cached_value)}</td>
+                <td class="text-right">${fmtMoney(r.replay_value)}</td>
+              </tr>`).join('')}
+          </tbody>
+        </table>
+      </div>` : ''}
+
+    ${d.po_status_problems.length > 0 ? `
+      <div class="bg-white rounded-xl shadow-sm border border-amber-300 mb-4">
+        <div class="p-4 border-b border-slate-200">
+          <h3 class="font-semibold text-amber-700">PO status anomalies</h3>
+          <p class="text-xs text-slate-600">Status doesn't match what receiving history suggests it should be.</p>
+        </div>
+        <table>
+          <thead><tr><th>PO #</th><th>Current</th><th>Expected</th></tr></thead>
+          <tbody>
+            ${d.po_status_problems.map(r => `<tr><td>${escapeHtml(r.po_number)}</td><td>${escapeHtml(r.current_status)}</td><td>${escapeHtml(r.expected_status)}</td></tr>`).join('')}
+          </tbody>
+        </table>
+      </div>` : ''}
+  `;
 }
 
 // ---------- Boot ----------
