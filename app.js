@@ -1029,7 +1029,19 @@ async function openPOEditor(id) {
     return;
   }
   const existing = id ? await api('po.get', { id }) : null;
-  const lines = existing ? existing.lines.map(l => ({ ...l })) : [];
+  // Convert stored base-unit values back to pack-units for display.
+  // num_packs = qty_ordered / pack_qty, pack_cost = unit_cost * pack_qty.
+  // pack_qty comes from the SupplierPrice for (item, this PO's supplier); fallback = 1.
+  const lines = existing ? existing.lines.map(l => {
+    const it = itemById[l.item_id];
+    const sp = it && it.supplier_prices ? it.supplier_prices.find(p => p.supplier_id === existing.supplier_id) : null;
+    const pq = sp && sp.pack_qty > 0 ? sp.pack_qty : 1;
+    return {
+      ...l,
+      num_packs: pq > 0 ? l.qty_ordered / pq : l.qty_ordered,
+      pack_cost: l.unit_cost * pq
+    };
+  }) : [];
 
   // If any PO line references a deleted item, include a synthetic option so the dropdown
   // shows it instead of silently swapping it to the first item on save.
@@ -1043,26 +1055,32 @@ async function openPOEditor(id) {
   });
   const allItemOptions = ghostItems.concat(items);
 
-  // Look up best supplier-specific unit cost for (item, supplier).
-  // Returns cost per ONE base unit (pack_cost / pack_qty), suitable for the PO line unit_cost field.
+  // Returns the current SupplierPrice for (item, supplier), or null.
   const supplierPriceFor = (itemId, supplierId) => {
     const it = itemById[itemId];
     if (!it || !it.supplier_prices || !supplierId) return null;
-    const sp = it.supplier_prices.find(p => p.supplier_id === supplierId);
-    if (!sp || !sp.pack_qty) return null;
-    return sp.pack_cost / sp.pack_qty;
+    return it.supplier_prices.find(p => p.supplier_id === supplierId) || null;
   };
 
   const lineRowHtml = (l, idx) => `
     <tr data-line="${idx}">
       <td>
         <select class="input" data-field="item_id">
-          ${allItemOptions.map(it => `<option value="${it.id}" ${l.item_id === it.id ? 'selected' : ''}>${escapeHtml(it.name)} (${escapeHtml(it.unit || '')})</option>`).join('')}
+          ${allItemOptions.map(it => `<option value="${it.id}" ${l.item_id === it.id ? 'selected' : ''}>${escapeHtml(it.name)}</option>`).join('')}
         </select>
       </td>
-      <td><input class="input text-right" type="number" step="any" data-field="qty_ordered" value="${l.qty_ordered || 1}" /></td>
-      <td><input class="input text-right" type="number" step="any" data-field="unit_cost" value="${l.unit_cost || 0}" /></td>
-      <td class="text-right line-total">${fmtMoney((l.qty_ordered || 0) * (l.unit_cost || 0))}</td>
+      <td class="pack-cell text-xs text-center text-slate-500 whitespace-nowrap">—</td>
+      <td>
+        <input class="input text-right" type="number" step="any" min="0" data-field="num_packs"
+          value="${l.num_packs == null || l.num_packs === '' ? '' : l.num_packs}"
+          placeholder="qty" />
+      </td>
+      <td>
+        <input class="input text-right" type="number" step="any" min="0" data-field="pack_cost"
+          value="${l.pack_cost == null || l.pack_cost === '' ? '' : l.pack_cost}"
+          placeholder="auto" title="Leave blank to auto-fill from supplier price" />
+      </td>
+      <td class="text-right line-total">${fmtMoney((l.num_packs || 0) * (l.pack_cost || 0))}</td>
       <td><button class="btn btn-ghost text-rose-600" data-rm>×</button></td>
     </tr>`;
 
@@ -1084,11 +1102,19 @@ async function openPOEditor(id) {
         <button class="btn btn-secondary text-xs" id="add-line">+ Add line</button>
       </div>
       <table class="border border-slate-200 rounded">
-        <thead><tr><th>Item</th><th class="text-right">Qty</th><th class="text-right">Unit cost</th><th class="text-right">Line total</th><th></th></tr></thead>
+        <thead><tr>
+          <th>Item</th>
+          <th class="text-center">Pack</th>
+          <th class="text-right">Qty <span class="text-xs font-normal text-slate-400">(packs)</span></th>
+          <th class="text-right">Pack cost</th>
+          <th class="text-right">Line total</th>
+          <th></th>
+        </tr></thead>
         <tbody id="po-lines">
           ${lines.length === 0 ? '' : lines.map(lineRowHtml).join('')}
         </tbody>
       </table>
+      <p class="text-xs text-slate-500 mt-2">Enter qty in <b>packs</b> (1 kg, 1 can, 1 sack, 1 gallon…). The system converts to base units behind the scenes using the supplier's pack data.</p>
       <div class="text-right mt-3 text-sm">
         Subtotal: <span id="po-subtotal" class="font-semibold">${fmtMoney(0)}</span>
         &nbsp;+ Tax: <span id="po-tax-disp">${fmtMoney(existing ? existing.tax : 0)}</span>
@@ -1110,59 +1136,99 @@ async function openPOEditor(id) {
       const recalc = () => {
         let sub = 0;
         tbody.querySelectorAll('tr').forEach(tr => {
-          const q = Number(tr.querySelector('[data-field="qty_ordered"]').value) || 0;
-          const c = Number(tr.querySelector('[data-field="unit_cost"]').value) || 0;
-          tr.querySelector('.line-total').textContent = fmtMoney(q * c);
-          sub += q * c;
+          const n = Number(tr.querySelector('[data-field="num_packs"]').value) || 0;
+          const c = Number(tr.querySelector('[data-field="pack_cost"]').value) || 0;
+          tr.querySelector('.line-total').textContent = fmtMoney(n * c);
+          sub += n * c;
         });
         const tax = Number(m.querySelector('[name="tax"]').value) || 0;
         m.querySelector('#po-subtotal').textContent = fmtMoney(sub);
         m.querySelector('#po-tax-disp').textContent = fmtMoney(tax);
         m.querySelector('#po-total').textContent = fmtMoney(sub + tax);
       };
-      const addLine = (data) => {
-        const idx = counter++;
-        // Use a tbody wrapper so the browser parses <tr>...</tr> correctly.
-        // (Setting tr.innerHTML = '<tr>...</tr>' strips the inner tags and only the first
-        //  <td> ends up as a child — which is why the row showed item dropdown but no qty/cost/total.)
-        const wrap = document.createElement('tbody');
-        wrap.innerHTML = lineRowHtml(data || { item_id: items[0] && items[0].id, qty_ordered: 1, unit_cost: 0 }, idx);
-        const tr = wrap.firstElementChild;
-        tbody.appendChild(tr);
-        bindRow(tr);
-        recalc();
+      // Update the Pack column display for a row, AND stash pack_qty on the row's dataset.
+      // The save handler reads tr.dataset.packQty to convert packs ↔ base units.
+      const updatePackCell = (tr) => {
+        const itemId = tr.querySelector('[data-field="item_id"]').value;
+        const supId = m.querySelector('[name="supplier_id"]').value;
+        const item = itemById[itemId];
+        const sp = supplierPriceFor(itemId, supId);
+        const cell = tr.querySelector('.pack-cell');
+        if (sp && sp.pack_qty > 0) {
+          tr.dataset.packQty = sp.pack_qty;
+          cell.textContent = (sp.pack_size || '') + ' = ' + fmtNum(sp.pack_qty) + ' ' + (item ? item.unit : '');
+          cell.classList.remove('text-amber-600');
+        } else {
+          tr.dataset.packQty = 1;
+          cell.textContent = supId ? 'no price set' : 'pick supplier';
+          cell.classList.add('text-amber-600');
+        }
       };
-      // Auto-fill unit_cost from the supplier's price for this item, if one exists.
-      // Only overwrites when the field is empty/zero — never clobbers a user's manual entry.
+      // Auto-fill pack_cost from the (item, supplier) SupplierPrice. Skips if user typed something.
       const autoFillCost = (tr) => {
         const itemId = tr.querySelector('[data-field="item_id"]').value;
         const supId = m.querySelector('[name="supplier_id"]').value;
-        const costInput = tr.querySelector('[data-field="unit_cost"]');
-        if (Number(costInput.value) > 0) return;  // respect manual entry
-        const c = supplierPriceFor(itemId, supId);
-        if (c != null) costInput.value = c.toFixed(4);
+        const costInput = tr.querySelector('[data-field="pack_cost"]');
+        if (costInput.value !== '' && Number(costInput.value) > 0) return;
+        const sp = supplierPriceFor(itemId, supId);
+        if (sp && sp.pack_cost) {
+          costInput.value = sp.pack_cost;
+          costInput.style.background = '#ecfdf5';
+          costInput.title = 'Auto-filled from supplier price. Edit to override.';
+        }
       };
       const bindRow = (tr) => {
         tr.querySelectorAll('input, select').forEach(el => el.oninput = recalc);
-        // Item change → try to auto-fill from supplier price
-        tr.querySelector('[data-field="item_id"]').addEventListener('change', () => { autoFillCost(tr); recalc(); });
+        // Item change → refresh pack info + auto-fill cost for the new item
+        tr.querySelector('[data-field="item_id"]').addEventListener('change', () => {
+          const costInput = tr.querySelector('[data-field="pack_cost"]');
+          costInput.value = '';
+          costInput.style.background = '';
+          updatePackCell(tr);
+          autoFillCost(tr);
+          recalc();
+        });
+        // If the user manually edits the cost, clear the auto-fill hint
+        tr.querySelector('[data-field="pack_cost"]').addEventListener('input', (e) => {
+          e.target.style.background = '';
+        });
         tr.querySelector('[data-rm]').onclick = () => { tr.remove(); recalc(); };
       };
-      tbody.querySelectorAll('tr').forEach(bindRow);
-      // Supplier change → try to auto-fill cost for every line that's still empty
+      const addLine = (data) => {
+        const idx = counter++;
+        const wrap = document.createElement('tbody');
+        wrap.innerHTML = lineRowHtml(data || { item_id: items[0] && items[0].id, num_packs: 1, pack_cost: '' }, idx);
+        const tr = wrap.firstElementChild;
+        tbody.appendChild(tr);
+        bindRow(tr);
+        updatePackCell(tr);
+        autoFillCost(tr);
+        recalc();
+      };
+      tbody.querySelectorAll('tr').forEach(tr => {
+        bindRow(tr);
+        updatePackCell(tr);
+      });
+      // Supplier change → refresh Pack column + try to auto-fill cost for every line still empty
       m.querySelector('[name="supplier_id"]').addEventListener('change', () => {
-        tbody.querySelectorAll('tr').forEach(autoFillCost);
+        tbody.querySelectorAll('tr').forEach(tr => {
+          updatePackCell(tr);
+          autoFillCost(tr);
+        });
         recalc();
       });
       m.querySelector('[name="tax"]').oninput = recalc;
       m.querySelector('#add-line').onclick = () => addLine();
       if (!lines.length) addLine();
-      // For newly-created rows on first open, try to auto-fill if supplier already chosen
+      // For pre-loaded rows on first open, try to auto-fill if supplier already chosen
       tbody.querySelectorAll('tr').forEach(autoFillCost);
       recalc();
 
       m.querySelector('[data-cancel]').onclick = () => close(null);
       m.querySelector('[data-save]').onclick = async () => {
+        // Convert pack-units back to base units for storage:
+        //   qty_ordered (base) = num_packs × pack_qty
+        //   unit_cost (per base) = pack_cost / pack_qty
         const payload = {
           id: existing ? existing.id : undefined,
           supplier_id: m.querySelector('[name="supplier_id"]').value,
@@ -1170,11 +1236,16 @@ async function openPOEditor(id) {
           expected_date: m.querySelector('[name="expected_date"]').value,
           notes: m.querySelector('[name="notes"]').value,
           tax: Number(m.querySelector('[name="tax"]').value) || 0,
-          lines: Array.from(tbody.querySelectorAll('tr')).map(tr => ({
-            item_id: tr.querySelector('[data-field="item_id"]').value,
-            qty_ordered: Number(tr.querySelector('[data-field="qty_ordered"]').value),
-            unit_cost: Number(tr.querySelector('[data-field="unit_cost"]').value)
-          }))
+          lines: Array.from(tbody.querySelectorAll('tr')).map(tr => {
+            const packQty = Number(tr.dataset.packQty) || 1;
+            const numPacks = Number(tr.querySelector('[data-field="num_packs"]').value) || 0;
+            const packCost = Number(tr.querySelector('[data-field="pack_cost"]').value) || 0;
+            return {
+              item_id: tr.querySelector('[data-field="item_id"]').value,
+              qty_ordered: numPacks * packQty,
+              unit_cost: packQty > 0 ? packCost / packQty : 0
+            };
+          })
         };
         try {
           if (existing) await api('po.update', payload);
@@ -1192,6 +1263,22 @@ async function openPOModal(id) {
   const po = await api('po.get', { id });
   const isDraft = po.status === 'draft';
   const isReceivable = po.status === 'sent' || po.status === 'partial';
+  // Per-line: look up pack_qty from the (item, this PO's supplier) SupplierPrice so we can
+  // display in pack-units instead of raw base units (1 KG flour, not "1000 g flour").
+  const itemsByIdLocal = {};
+  (state.boot.items || []).forEach(i => { itemsByIdLocal[i.id] = i; });
+  const packInfo = (line) => {
+    const it = itemsByIdLocal[line.item_id];
+    const sp = it && it.supplier_prices ? it.supplier_prices.find(p => p.supplier_id === po.supplier_id) : null;
+    const pq = sp && sp.pack_qty > 0 ? sp.pack_qty : 1;
+    return {
+      pack_qty: pq,
+      pack_size: sp ? sp.pack_size : '',
+      packs_ordered: pq > 0 ? line.qty_ordered / pq : line.qty_ordered,
+      packs_received: pq > 0 ? line.qty_received / pq : line.qty_received,
+      pack_cost: line.unit_cost * pq
+    };
+  };
   const html = `
     <div class="flex justify-between items-start mb-3">
       <div>
@@ -1202,16 +1289,27 @@ async function openPOModal(id) {
     </div>
     ${po.notes ? `<p class="text-sm text-slate-600 mb-3">${escapeHtml(po.notes)}</p>` : ''}
     <table class="border border-slate-200 rounded mb-3">
-      <thead><tr><th>Item</th><th class="text-right">Ordered</th><th class="text-right">Received</th><th class="text-right">Unit cost</th><th class="text-right">Line total</th></tr></thead>
+      <thead><tr>
+        <th>Item</th>
+        <th class="text-center">Pack</th>
+        <th class="text-right">Ordered</th>
+        <th class="text-right">Received</th>
+        <th class="text-right">Pack cost</th>
+        <th class="text-right">Line total</th>
+      </tr></thead>
       <tbody>
-        ${po.lines.map(l => `
+        ${po.lines.map(l => {
+          const pi = packInfo(l);
+          return `
           <tr>
-            <td>${escapeHtml(l.item_name)} <span class="text-xs text-slate-400">(${escapeHtml(l.unit)})</span></td>
-            <td class="text-right">${fmtNum(l.qty_ordered)}</td>
-            <td class="text-right">${fmtNum(l.qty_received)}</td>
-            <td class="text-right">${fmtMoney(l.unit_cost)}</td>
+            <td>${escapeHtml(l.item_name)}</td>
+            <td class="text-center text-xs text-slate-500">${escapeHtml(pi.pack_size) || `1 ${escapeHtml(l.unit)}`}</td>
+            <td class="text-right">${fmtNum(pi.packs_ordered)}</td>
+            <td class="text-right">${fmtNum(pi.packs_received)}</td>
+            <td class="text-right">${fmtMoney(pi.pack_cost)}</td>
             <td class="text-right">${fmtMoney(l.line_total)}</td>
-          </tr>`).join('')}
+          </tr>`;
+        }).join('')}
       </tbody>
     </table>
     <div class="text-right text-sm mb-4">
@@ -1280,23 +1378,49 @@ function viewReceiving(root) {
 async function openReceiveModal(poId) {
   const preview = await api('receive.preview', { po_id: poId });
   const locs = (state.boot.locations || []).filter(l => l.active);
+  // Look up pack info per line — same logic as the PO view modal.
+  const itemsByIdLocal = {};
+  (state.boot.items || []).forEach(i => { itemsByIdLocal[i.id] = i; });
+  const packInfoFor = (line) => {
+    const it = itemsByIdLocal[line.item_id];
+    const sp = it && it.supplier_prices ? it.supplier_prices.find(p => p.supplier_id === preview.supplier_id) : null;
+    const pq = sp && sp.pack_qty > 0 ? sp.pack_qty : 1;
+    return {
+      pack_qty: pq,
+      pack_size: sp ? sp.pack_size : '',
+      packs_outstanding: pq > 0 ? line.qty_outstanding / pq : line.qty_outstanding,
+      pack_cost: line.unit_cost * pq,
+      unit: it ? it.unit : line.unit
+    };
+  };
   const html = `
-    <p class="text-sm text-slate-600 mb-2">PO <b>${escapeHtml(preview.po_number)}</b> — enter the quantity received now per line. Leave 0 to skip.</p>
+    <p class="text-sm text-slate-600 mb-2">PO <b>${escapeHtml(preview.po_number)}</b> — enter the number of <b>packs</b> received now per line. Leave 0 to skip.</p>
     ${fieldset('Destination location (applies to all lines)', `<select class="input max-w-xs" name="po_location_id">
       ${locs.map(l => `<option value="${l.id}">${escapeHtml(l.name)}</option>`).join('')}
     </select>`)}
     <table class="border border-slate-200 rounded">
-      <thead><tr><th>Item</th><th class="text-right">Outstanding</th><th class="text-right">Receive now</th><th class="text-right">Unit cost</th></tr></thead>
+      <thead><tr>
+        <th>Item</th>
+        <th class="text-center">Pack</th>
+        <th class="text-right">Outstanding</th>
+        <th class="text-right">Receive now <span class="text-xs font-normal text-slate-400">(packs)</span></th>
+        <th class="text-right">Pack cost</th>
+      </tr></thead>
       <tbody>
-        ${preview.lines.map(l => `
-          <tr data-line="${l.line_id}">
-            <td>${escapeHtml(l.item_name)} <span class="text-xs text-slate-400">(${escapeHtml(l.unit)})</span></td>
-            <td class="text-right">${fmtNum(l.qty_outstanding)}</td>
-            <td class="text-right"><input class="input text-right" type="number" step="any" min="0" max="${l.qty_outstanding}" data-qty value="${l.qty_outstanding}" /></td>
-            <td class="text-right"><input class="input text-right" type="number" step="any" data-cost value="${l.unit_cost}" /></td>
-          </tr>`).join('')}
+        ${preview.lines.map(l => {
+          const pi = packInfoFor(l);
+          return `
+          <tr data-line="${l.line_id}" data-pack-qty="${pi.pack_qty}">
+            <td>${escapeHtml(l.item_name)}</td>
+            <td class="text-center text-xs text-slate-500">${escapeHtml(pi.pack_size) || `1 ${escapeHtml(pi.unit)}`}</td>
+            <td class="text-right">${fmtNum(pi.packs_outstanding)}</td>
+            <td class="text-right"><input class="input text-right" type="number" step="any" min="0" max="${pi.packs_outstanding}" data-packs value="${pi.packs_outstanding}" /></td>
+            <td class="text-right"><input class="input text-right" type="number" step="any" data-pack-cost value="${pi.pack_cost}" /></td>
+          </tr>`;
+        }).join('')}
       </tbody>
     </table>
+    <p class="text-xs text-slate-500 mt-2">The system converts packs to base units for the inventory ledger.</p>
     <div class="flex justify-end gap-2 mt-4">
       <button class="btn btn-secondary" data-cancel>Cancel</button>
       <button class="btn btn-primary" data-post>Post receipt</button>
@@ -1307,11 +1431,19 @@ async function openReceiveModal(poId) {
     onMount: (m, close) => {
       m.querySelector('[data-cancel]').onclick = () => close(null);
       m.querySelector('[data-post]').onclick = async () => {
-        const lines = Array.from(m.querySelectorAll('tr[data-line]')).map(tr => ({
-          line_id: tr.dataset.line,
-          qty_received_now: Number(tr.querySelector('[data-qty]').value),
-          unit_cost: Number(tr.querySelector('[data-cost]').value)
-        })).filter(l => l.qty_received_now > 0);
+        // Convert pack-units back to base for the backend:
+        //   qty_received_now (base) = packs × pack_qty
+        //   unit_cost (per base)    = pack_cost / pack_qty
+        const lines = Array.from(m.querySelectorAll('tr[data-line]')).map(tr => {
+          const packQty = Number(tr.dataset.packQty) || 1;
+          const packs = Number(tr.querySelector('[data-packs]').value) || 0;
+          const packCost = Number(tr.querySelector('[data-pack-cost]').value) || 0;
+          return {
+            line_id: tr.dataset.line,
+            qty_received_now: packs * packQty,
+            unit_cost: packQty > 0 ? packCost / packQty : 0
+          };
+        }).filter(l => l.qty_received_now > 0);
         if (!lines.length) { toast('Nothing to receive', 'error'); return; }
         try {
           const res = await api('receive.post', {
